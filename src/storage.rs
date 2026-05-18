@@ -59,19 +59,29 @@ impl Storage {
         Ok(())
     }
 
-    /// Load up to `limit` history records for a proxy, newest first.
-    pub fn load_history(&self, proxy_id: &str, limit: usize) -> Result<Vec<ConnectionRecord>> {
+    /// Load a page of history records for a proxy, newest first: skip
+    /// `offset` records, then return up to `limit`.
+    pub fn load_history(
+        &self,
+        proxy_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ConnectionRecord>> {
         let prefix = format!("{HIST_PREFIX}{proxy_id}:");
         let mut out = Vec::new();
+        let mut seen = 0usize;
         for item in self.db.prefix_iterator(prefix.as_bytes()) {
             let (k, v) = item?;
             if !k.starts_with(prefix.as_bytes()) {
                 break;
             }
-            out.push(serde_json::from_slice(&v)?);
-            if out.len() >= limit {
-                break;
+            if seen >= offset {
+                out.push(serde_json::from_slice(&v)?);
+                if out.len() >= limit {
+                    break;
+                }
             }
+            seen += 1;
         }
         Ok(out)
     }

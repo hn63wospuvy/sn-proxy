@@ -1,13 +1,27 @@
 # sn-proxy
 
-A multi-instance **SOCKS5 proxy server** written in Rust with a realtime web
-admin. Everything runs on a single Tokio runtime.
+A multi-instance, multi-protocol **proxy server** written in Rust with a
+realtime web admin. Everything runs on a single Tokio runtime.
+
+## Supported protocols
+
+| Protocol      | Notes                                                          |
+|---------------|----------------------------------------------------------------|
+| `socks5`      | RFC 1928, optional username/password auth (RFC 1929)           |
+| `http`        | `CONNECT` tunnelling + plain HTTP forwarding, optional Basic auth |
+| `https`       | HTTP proxy wrapped in TLS (config cert or auto self-signed)    |
+| `shadowsocks` | AEAD (`aes-256-gcm`, `aes-128-gcm`, `chacha20-ietf-poly1305`)  |
+| `tcp`         | Plain TCP forwarder to a fixed `host:port` destination         |
+
+Each proxy also has optional advanced tuning: **TCP keep-alive** interval,
+**idle timeout** (drop connections with no traffic), and **connect timeout**
+(when dialing the destination).
 
 ## Features
 
-- **SOCKS5 proxy** (RFC 1928) with optional username/password auth (RFC 1929)
+- **Four proxy protocols** — pick one per proxy instance (see table above)
 - **Web admin** to create, edit, start/stop and delete multiple proxies — each
-  with its own listen address and credentials
+  with its own protocol, listen address and credentials
 - **Realtime monitoring** over a websocket (built on
   [`fastwebsockets`](https://github.com/denoland/fastwebsockets)): live list of
   open connections per proxy with source IP, destination and bytes
@@ -25,51 +39,86 @@ Then open the web admin at <http://localhost:8080>.
 
 Command-line options:
 
-| Option              | Default | Description                                      |
-|---------------------|---------|--------------------------------------------------|
-| `-p`, `--port`      | `8080`  | Web admin port; the admin always binds `0.0.0.0` |
-| `-d`, `--data-dir`  | `data`  | RocksDB data directory                           |
-| `-h`, `--help`      | —       | Print help and exit                              |
+| Option                       | Default        | Description                                                                 |
+|-------------------------------|----------------|-----------------------------------------------------------------------------|
+| `-c`, `--config <FILE>`       | —              | Properties config file (see below)                                          |
+| `-p`, `--port <[HOST:]PORT>`  | `0.0.0.0:8080` | Web admin address. A bare port binds every interface; `HOST:PORT` binds one  |
+| `-d`, `--data-dir <DIR>`      | `data`         | RocksDB data directory                                                      |
+| `-h`, `--help`                | —              | Print help and exit                                                         |
 
 ```sh
-# custom port and data directory
-cargo run --release -- --port 9090 --data-dir /var/lib/sn-proxy
+cargo run --release -- --config config.properties
+cargo run --release -- --port 127.0.0.1:9991 --data-dir /var/lib/sn-proxy
 ```
 
-`RUST_LOG` (default `sn_proxy=info`) still controls the log filter.
+### Config file
+
+A `key=value` properties file (`#` / `!` comments). Command-line `-p` / `-d`
+override it. See [`config.example.properties`](config.example.properties).
+
+| Key              | Description                                                      |
+|------------------|------------------------------------------------------------------|
+| `port`           | Web admin port or `HOST:PORT`                                    |
+| `data_dir`       | RocksDB data directory                                           |
+| `tls_cert`       | PEM certificate for the `https` proxy (else a self-signed one)   |
+| `tls_key`        | PEM private key for the `https` proxy                            |
+| `admin_user`     | Web admin login username — setting it (with a password) enables login |
+| `admin_password` | Web admin login password                                         |
+| `admin_network`  | Restrict that admin's login to a CIDR, e.g. `192.168.1.0/24`     |
+| `admin.<NAME>.password` | An additional admin account (multi-admin form)            |
+| `admin.<NAME>.network`  | That admin's allowed CIDR (optional)                      |
+
+Configuring at least one admin makes the web admin require sign-in (cookie
+session); otherwise it is open. Each admin may have its own `network` CIDR —
+sign-in is then only accepted from a client IP inside that range. Admins
+without a network may sign in from anywhere. `RUST_LOG` (default
+`sn_proxy=info`) controls the log filter.
 
 Proxy configs are persisted; proxies that were running are auto-started on the
 next launch.
 
 ## Using a proxy
 
-After creating a proxy listening on e.g. `0.0.0.0:1080` with user `alice`:
-
 ```sh
+# SOCKS5
 curl --socks5 alice:secret@127.0.0.1:1080 https://example.com
+# HTTP / HTTPS proxy
+curl -x http://alice:secret@127.0.0.1:1081 https://example.com
+curl -x https://127.0.0.1:1082 --proxy-insecure https://example.com
+# Shadowsocks: point any Shadowsocks client at the listen address,
+# using the configured cipher and password.
 ```
 
 ## HTTP API
 
 | Method & path                       | Description                       |
 |--------------------------------------|-----------------------------------|
+| `GET    /api/session`                | Whether login is required / active |
+| `POST   /api/login`                  | Sign in, sets a session cookie    |
+| `POST   /api/logout`                 | Sign out                          |
 | `GET    /api/proxies`                | List proxies + live status        |
 | `POST   /api/proxies`                | Create a proxy                    |
 | `POST   /api/proxies/{id}`           | Update a proxy                    |
 | `DELETE /api/proxies/{id}`           | Delete a proxy and its history    |
 | `POST   /api/proxies/{id}/start`     | Start a proxy                     |
 | `POST   /api/proxies/{id}/stop`      | Stop a proxy                      |
-| `GET    /api/proxies/{id}/history`   | Closed-connection history         |
+| `GET    /api/proxies/{id}/history`   | History page (`?offset=&limit=`)  |
+| `DELETE /api/proxies/{id}/history`   | Delete all history for a proxy    |
 | `GET    /ws`                         | Websocket monitoring feed         |
 
 ## Architecture
 
-| Module        | Responsibility                                          |
-|---------------|---------------------------------------------------------|
-| `socks5.rs`   | SOCKS5 handshake, auth, CONNECT relay, byte counting    |
-| `manager.rs`  | Proxy lifecycle, live connection registry, broadcasting |
-| `storage.rs`  | RocksDB persistence (configs + history)                 |
-| `api.rs`      | axum HTTP routes                                        |
-| `ws.rs`       | fastwebsockets monitoring feed                          |
-| `monitor.rs`  | Snapshot/event payloads                                 |
-| `model.rs`    | Shared data types                                       |
+| Module           | Responsibility                                          |
+|------------------|---------------------------------------------------------|
+| `socks5.rs`      | SOCKS5 handshake, auth, CONNECT relay                   |
+| `http.rs`        | HTTP/HTTPS proxy (CONNECT + forwarding, Basic auth)     |
+| `shadowsocks.rs` | Shadowsocks AEAD server                                 |
+| `tcp.rs`         | Plain TCP forwarder                                     |
+| `tls.rs`         | Cert loading / self-signed TLS acceptor for HTTPS       |
+| `relay.rs`       | Connection tracking, byte counting, keep-alive, timeouts |
+| `manager.rs`     | Proxy lifecycle, protocol dispatch, connection registry |
+| `storage.rs`     | RocksDB persistence (configs + history)                 |
+| `api.rs`         | axum HTTP routes                                        |
+| `ws.rs`          | fastwebsockets monitoring feed                          |
+| `monitor.rs`     | Snapshot/event payloads                                 |
+| `model.rs`       | Shared data types                                       |

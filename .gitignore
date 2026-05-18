@@ -1,3 +1,8 @@
 /target
+# RocksDB data directories (default "data", or whatever data_dir points at)
 /data
+/data1
 *.log
+# local config may hold admin_password — keep only the example committed
+/config.properties
+*.pem

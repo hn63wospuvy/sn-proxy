@@ -36,6 +36,8 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.danger:hover { border-color: var(--bad); color: var(--bad); }
   button.tiny { padding: 4px 9px; font-size: 12px; }
+  button:disabled { opacity: .4; cursor: default; }
+  button:disabled:hover { border-color: var(--border); }
   .proxy {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 10px; margin-bottom: 18px; overflow: hidden;
@@ -80,10 +82,11 @@
   .modal h2 { padding: 16px 20px; font-size: 16px; border-bottom: 1px solid var(--border); }
   .modal-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
   label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
-  input {
+  input, select {
     width: 100%; font: inherit; padding: 8px 10px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--bg); color: var(--text);
   }
+  .badge.proto { background: rgba(59,130,246,.16); color: var(--accent); }
   .modal-foot {
     display: flex; justify-content: flex-end; gap: 9px;
     padding: 14px 20px; border-top: 1px solid var(--border);
@@ -97,9 +100,25 @@
   <h1>sn<span>·</span>proxy</h1>
   <span class="ws-status"><span class="dot" id="wsDot"></span><span id="wsText">connecting…</span></span>
   <div class="spacer"></div>
+  <button id="logoutBtn" style="display:none" onclick="logout()">Logout</button>
   <button class="primary" onclick="openForm()">+ New Proxy</button>
 </header>
 <main id="list"></main>
+
+<!-- login overlay -->
+<div class="modal-bg" id="loginModal">
+  <div class="modal" style="width: 360px;">
+    <h2>Sign in to sn·proxy</h2>
+    <div class="modal-body">
+      <div><label>Username</label><input id="lgUser" autocomplete="username" /></div>
+      <div><label>Password</label><input id="lgPass" type="password" autocomplete="current-password" /></div>
+      <div class="err" id="lgErr"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="primary" id="lgBtn" onclick="doLogin()">Sign in</button>
+    </div>
+  </div>
+</div>
 
 <!-- create / edit modal -->
 <div class="modal-bg" id="formModal">
@@ -108,15 +127,50 @@
     <div class="modal-body">
       <div><label>Name</label><input id="fName" placeholder="My proxy" /></div>
       <div>
-        <label>Listen address</label>
-        <input id="fAddr" placeholder="0.0.0.0:1080" />
-        <div class="hint">host:port the SOCKS5 proxy binds to</div>
+        <label>Protocol</label>
+        <select id="fProto" onchange="onProtoChange()">
+          <option value="socks5">SOCKS5</option>
+          <option value="http">HTTP</option>
+          <option value="https">HTTPS (TLS)</option>
+          <option value="shadowsocks">Shadowsocks</option>
+          <option value="tcp">TCP forwarder</option>
+        </select>
       </div>
       <div>
+        <label>Listen address</label>
+        <input id="fAddr" placeholder="0.0.0.0:1080" />
+        <div class="hint">host:port the proxy binds to</div>
+      </div>
+      <!-- tcp forwarder destination -->
+      <div id="rowForward" style="display:none;">
+        <label>Forward to</label>
+        <input id="fForward" placeholder="10.0.0.5:5432" />
+        <div class="hint">every connection is forwarded to this host:port</div>
+      </div>
+      <!-- username/password auth: socks5, http, https -->
+      <div id="rowUser">
         <label>Username (optional — leave blank to disable auth)</label>
         <input id="fUser" placeholder="" autocomplete="off" />
       </div>
-      <div><label>Password</label><input id="fPass" type="text" placeholder="" autocomplete="off" /></div>
+      <!-- shadowsocks cipher -->
+      <div id="rowCipher" style="display:none;">
+        <label>Cipher</label>
+        <select id="fCipher">
+          <option value="aes-256-gcm">aes-256-gcm</option>
+          <option value="aes-128-gcm">aes-128-gcm</option>
+          <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305</option>
+        </select>
+      </div>
+      <div id="rowPass"><label id="lblPass">Password</label><input id="fPass" type="text" placeholder="" autocomplete="off" /></div>
+      <!-- advanced settings (all protocols) -->
+      <div style="border-top:1px solid var(--border); padding-top:12px;">
+        <div class="hint" style="margin-bottom:8px; text-transform:uppercase; letter-spacing:.05em;">Advanced (0 = off)</div>
+        <div style="display:flex; gap:10px;">
+          <div style="flex:1;"><label>Keep-alive (s)</label><input id="fKeepalive" type="number" min="0" placeholder="0" /></div>
+          <div style="flex:1;"><label>Idle timeout (s)</label><input id="fIdle" type="number" min="0" placeholder="0" /></div>
+          <div style="flex:1;"><label>Connect timeout (s)</label><input id="fConnTimeout" type="number" min="0" placeholder="0" /></div>
+        </div>
+      </div>
       <div class="err" id="formErr"></div>
     </div>
     <div class="modal-foot">
@@ -130,7 +184,7 @@
 <div class="modal-bg" id="histModal">
   <div class="modal" style="width: 760px;">
     <h2 id="histTitle">Connection History</h2>
-    <div class="modal-body" style="padding: 0;">
+    <div class="modal-body" style="padding: 0; max-height: 55vh; overflow: auto;">
       <table>
         <thead><tr>
           <th class="mono">Source</th><th class="mono">Destination</th>
@@ -140,7 +194,14 @@
       </table>
       <div class="empty" id="histEmpty" style="display:none;">No closed connections recorded.</div>
     </div>
-    <div class="modal-foot"><button onclick="closeHist()">Close</button></div>
+    <div class="modal-foot">
+      <button class="danger" onclick="clearHist()">Delete all history</button>
+      <div class="spacer"></div>
+      <button id="histPrev" onclick="histPage(-1)">‹ Prev</button>
+      <span id="histPageLabel" class="hint" style="align-self:center;"></span>
+      <button id="histNext" onclick="histPage(1)">Next ›</button>
+      <button onclick="closeHist()">Close</button>
+    </div>
   </div>
 </div>
 
@@ -194,8 +255,13 @@ function render(proxies) {
       <div class="proxy-head">
         <span class="name">${esc(p.name)}</span>
         <span class="addr">${esc(p.listen_addr)}</span>
+        <span class="badge proto">${esc((p.protocol || "socks5").toUpperCase())}</span>
         <span class="badge ${p.running ? "run" : "stop"}">${p.running ? "RUNNING" : "STOPPED"}</span>
-        ${p.auth_enabled ? `<span class="badge auth">AUTH: ${esc(p.auth_username || "")}</span>` : ""}
+        ${p.protocol === "shadowsocks"
+          ? `<span class="badge auth">${esc(p.ss_method || "")}</span>`
+          : p.protocol === "tcp"
+          ? `<span class="badge auth">→ ${esc(p.forward_to || "")}</span>`
+          : (p.auth_enabled ? `<span class="badge auth">AUTH: ${esc(p.auth_username || "")}</span>` : "")}
         <div class="spacer"></div>
         <div class="row-actions">
           ${p.running
@@ -271,12 +337,27 @@ async function delProxy(id, name) {
 }
 
 // ---- create / edit form ----
+// Show username/password for socks5/http/https, cipher for shadowsocks.
+function onProtoChange() {
+  const proto = $("fProto").value;
+  const ss = proto === "shadowsocks";
+  const tcp = proto === "tcp";
+  $("rowUser").style.display = (ss || tcp) ? "none" : "";
+  $("rowCipher").style.display = ss ? "" : "none";
+  $("rowForward").style.display = tcp ? "" : "none";
+  $("rowPass").style.display = tcp ? "none" : "";
+  $("lblPass").textContent = ss ? "Password (required)" : "Password";
+}
 function openForm() {
   editId = null;
   $("formTitle").textContent = "New Proxy";
   $("formSave").textContent = "Create";
   $("fName").value = ""; $("fAddr").value = "0.0.0.0:1080";
-  $("fUser").value = ""; $("fPass").value = ""; $("formErr").textContent = "";
+  $("fProto").value = "socks5"; $("fCipher").value = "aes-256-gcm";
+  $("fUser").value = ""; $("fPass").value = ""; $("fForward").value = "";
+  $("fKeepalive").value = ""; $("fIdle").value = ""; $("fConnTimeout").value = "";
+  $("formErr").textContent = "";
+  onProtoChange();
   $("formModal").classList.add("show");
 }
 function editProxy(id) {
@@ -286,21 +367,44 @@ function editProxy(id) {
   $("formTitle").textContent = "Edit Proxy";
   $("formSave").textContent = "Save";
   $("fName").value = p.name; $("fAddr").value = p.listen_addr;
+  $("fProto").value = p.protocol || "socks5";
+  $("fCipher").value = p.ss_method || "aes-256-gcm";
   $("fUser").value = p.auth_username || ""; $("fPass").value = "";
-  $("formErr").textContent = p.auth_enabled ? "Re-enter the password to keep auth enabled." : "";
+  $("fForward").value = p.forward_to || "";
+  $("fKeepalive").value = p.keepalive_secs || "";
+  $("fIdle").value = p.idle_timeout_secs || "";
+  $("fConnTimeout").value = p.connect_timeout_secs || "";
+  onProtoChange();
+  $("formErr").textContent = (p.auth_enabled || p.protocol === "shadowsocks")
+    ? "Re-enter the password to keep credentials." : "";
   $("formModal").classList.add("show");
 }
 function closeForm() { $("formModal").classList.remove("show"); }
 async function saveForm() {
+  const proto = $("fProto").value;
   const body = {
     name: $("fName").value.trim(),
+    protocol: proto,
     listen_addr: $("fAddr").value.trim(),
-    auth: null,
+    auth: null, ss_method: null, ss_password: null, forward_to: null,
+    keepalive_secs: parseInt($("fKeepalive").value) || 0,
+    idle_timeout_secs: parseInt($("fIdle").value) || 0,
+    connect_timeout_secs: parseInt($("fConnTimeout").value) || 0,
   };
-  const user = $("fUser").value.trim();
-  if (user) body.auth = { username: user, password: $("fPass").value };
+  if (proto === "shadowsocks") {
+    body.ss_method = $("fCipher").value;
+    body.ss_password = $("fPass").value;
+  } else if (proto === "tcp") {
+    body.forward_to = $("fForward").value.trim();
+  } else {
+    const user = $("fUser").value.trim();
+    if (user) body.auth = { username: user, password: $("fPass").value };
+  }
   if (!body.name || !body.listen_addr) {
     $("formErr").textContent = "Name and listen address are required."; return;
+  }
+  if (proto === "tcp" && !body.forward_to) {
+    $("formErr").textContent = "TCP forwarder needs a destination."; return;
   }
   const url = editId ? `/api/proxies/${editId}` : "/api/proxies";
   const r = await fetch(url, {
@@ -312,17 +416,24 @@ async function saveForm() {
   else $("formErr").textContent = (await r.json()).error || "request failed";
 }
 
-// ---- history ----
-async function openHist(id, name) {
+// ---- history (paginated) ----
+const HIST_PAGE = 20;
+let histState = { id: null, name: "", offset: 0 };
+
+function openHist(id, name) {
+  histState = { id, name, offset: 0 };
   $("histTitle").textContent = `History · ${name}`;
   $("histModal").classList.add("show");
-  $("histBody").innerHTML = "";
-  const recs = await fetch(`/api/proxies/${id}/history?limit=200`).then(r => r.json());
-  if (!recs.length) {
-    $("histEmpty").style.display = "block";
-    return;
-  }
-  $("histEmpty").style.display = "none";
+  loadHistPage();
+}
+async function loadHistPage() {
+  const { id, offset } = histState;
+  let data;
+  try {
+    data = await fetch(`/api/proxies/${id}/history?offset=${offset}&limit=${HIST_PAGE}`)
+      .then(r => r.json());
+  } catch (e) { return; }
+  const recs = data.records || [];
   $("histBody").innerHTML = recs.map(r => `
     <tr>
       <td class="mono">${esc(r.src_addr)}</td>
@@ -332,13 +443,67 @@ async function openHist(id, name) {
       <td>${r.closed_at ? fmtDuration(r.closed_at - r.started_at) : "—"}</td>
       <td>${r.closed_at ? fmtTime(r.closed_at) : "—"}</td>
     </tr>`).join("");
+  $("histEmpty").style.display = (recs.length === 0 && offset === 0) ? "block" : "none";
+  $("histPageLabel").textContent = recs.length
+    ? `${offset + 1}–${offset + recs.length}`
+    : "—";
+  $("histPrev").disabled = offset === 0;
+  $("histNext").disabled = !data.has_more;
+}
+function histPage(dir) {
+  const next = histState.offset + dir * HIST_PAGE;
+  if (next < 0) return;
+  histState.offset = next;
+  loadHistPage();
+}
+async function clearHist() {
+  if (!confirm(`Delete ALL history for “${histState.name}”?`)) return;
+  await fetch(`/api/proxies/${histState.id}/history`, { method: "DELETE" });
+  histState.offset = 0;
+  loadHistPage();
 }
 function closeHist() { $("histModal").classList.remove("show"); }
 
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") { closeForm(); closeHist(); }
 });
-connectWS();
+
+// ---- login / session ----
+let authRequired = false;
+async function init() {
+  let s;
+  try { s = await fetch("/api/session").then(r => r.json()); }
+  catch (e) { s = { auth_required: false, logged_in: true }; }
+  authRequired = s.auth_required;
+  if (s.auth_required && !s.logged_in) {
+    $("loginModal").classList.add("show");
+    $("lgUser").focus();
+  } else {
+    startApp();
+  }
+}
+function startApp() {
+  $("loginModal").classList.remove("show");
+  if (authRequired) $("logoutBtn").style.display = "";
+  connectWS();
+}
+async function doLogin() {
+  $("lgErr").textContent = "";
+  const r = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: $("lgUser").value, password: $("lgPass").value }),
+  });
+  if (r.ok) { startApp(); }
+  else $("lgErr").textContent = (await r.json().catch(() => ({}))).error || "login failed";
+}
+async function logout() {
+  await fetch("/api/logout", { method: "POST" });
+  location.reload();
+}
+$("lgPass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+
+init();
 </script>
 </body>
 </html>
