@@ -1,18 +1,19 @@
 //! Owns every proxy instance: lifecycle (start/stop), live connection
 //! tracking and the broadcast channel feeding realtime monitoring.
 
-use crate::model::{BasicAuth, Protocol, ProxyConfig};
+use crate::model::{BasicAuth, HeaderOverride, Protocol, ProxyConfig};
 use crate::monitor::{ActiveConn, MonitorEvent, ProxySnapshot};
 use crate::storage::Storage;
-use crate::{http, relay, shadowsocks, socks5, tcp};
+use crate::{http, relay, shadowsocks, socks5, tcp, tls, ws_proxy};
 use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -26,6 +27,8 @@ pub struct ConnEntry {
     /// Bytes relayed from destination to client.
     pub bytes_received: AtomicU64,
     pub started_at: i64,
+    /// Fires to abort this connection (admin "terminate" / "block IP").
+    pub cancel: CancellationToken,
 }
 
 /// Runtime state of one proxy.
@@ -39,6 +42,12 @@ pub struct ProxyRuntime {
     pub total_connections: AtomicU64,
     pub total_sent: AtomicU64,
     pub total_received: AtomicU64,
+    /// Per-proxy HTTPS acceptor built from a PKCS#12 keystore, when one is
+    /// configured; otherwise the global acceptor is used.
+    pub https_acceptor: Mutex<Option<TlsAcceptor>>,
+    /// Client-TLS connector presenting a PKCS#12 identity to upstream servers
+    /// that require mutual TLS (HTTP/HTTPS proxies only).
+    pub client_connector: Mutex<Option<Arc<TlsConnector>>>,
 }
 
 impl ProxyRuntime {
@@ -51,11 +60,16 @@ impl ProxyRuntime {
             total_connections: AtomicU64::new(0),
             total_sent: AtomicU64::new(0),
             total_received: AtomicU64::new(0),
+            https_acceptor: Mutex::new(None),
+            client_connector: Mutex::new(None),
         }
     }
 }
 
 /// Caller-supplied settings for creating or updating a proxy.
+///
+/// The PKCS#12 fields are tri-state on update: `None` keeps the stored value,
+/// `Some("")` clears it, and `Some(bytes)` replaces it.
 pub struct ProxySpec {
     pub name: String,
     pub protocol: Protocol,
@@ -67,6 +81,16 @@ pub struct ProxySpec {
     pub keepalive_secs: Option<u64>,
     pub idle_timeout_secs: Option<u64>,
     pub connect_timeout_secs: Option<u64>,
+    pub client_p12: Option<String>,
+    pub client_p12_password: Option<String>,
+    pub client_p12_alias: Option<String>,
+    pub client_p12_entry_password: Option<String>,
+    pub override_headers: Vec<HeaderOverride>,
+    pub server_p12: Option<String>,
+    pub server_p12_password: Option<String>,
+    pub server_truststore_p12: Option<String>,
+    pub server_truststore_password: Option<String>,
+    pub mtls_required: bool,
 }
 
 impl ProxySpec {
@@ -78,10 +102,10 @@ impl ProxySpec {
         if self.listen_addr.trim().is_empty() {
             bail!("listen address is required");
         }
-        if self.protocol == Protocol::Tcp
+        if matches!(self.protocol, Protocol::Tcp | Protocol::Websocket)
             && self.forward_to.as_deref().unwrap_or("").is_empty()
         {
-            bail!("tcp proxy needs a forward destination (host:port)");
+            bail!("this proxy needs a forward destination (host:port)");
         }
         if self.protocol == Protocol::Shadowsocks {
             let method = self.ss_method.as_deref().unwrap_or("");
@@ -167,6 +191,19 @@ impl AdminAuth {
     }
 }
 
+/// The IP portion of a `host:port` (or `[ipv6]:port`) source address.
+fn src_ip(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(i) = rest.find(']') {
+            return &rest[..i];
+        }
+    }
+    match addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => addr,
+    }
+}
+
 /// Central registry of all proxies.
 pub struct Manager {
     pub storage: Arc<Storage>,
@@ -174,8 +211,12 @@ pub struct Manager {
     pub events: broadcast::Sender<MonitorEvent>,
     /// Web-admin authentication.
     pub admin: AdminAuth,
-    /// Shared TLS acceptor for `https` proxies.
+    /// Global TLS acceptor for `https` proxies without their own keystore.
     pub tls: TlsAcceptor,
+    /// Client connector (no client certificate) for `https://` upstreams.
+    pub default_connector: TlsConnector,
+    /// Source addresses (IP or `IP:port`) refused at accept time.
+    pub blocklist: Mutex<HashSet<String>>,
 }
 
 impl Manager {
@@ -185,14 +226,18 @@ impl Manager {
         storage: Arc<Storage>,
         admin: AdminAuth,
         tls: TlsAcceptor,
+        default_connector: TlsConnector,
     ) -> Result<Arc<Self>> {
         let (events, _) = broadcast::channel(256);
+        let blocklist = storage.load_blocklist().unwrap_or_default();
         let manager = Arc::new(Self {
             storage: storage.clone(),
             proxies: DashMap::new(),
             events,
             admin,
             tls,
+            default_connector,
+            blocklist: Mutex::new(blocklist),
         });
         for cfg in storage.load_configs()? {
             let enabled = cfg.enabled;
@@ -219,6 +264,7 @@ impl Manager {
     /// Create and persist a new (stopped) proxy.
     pub fn create(&self, spec: ProxySpec) -> Result<ProxyConfig> {
         spec.validate()?;
+        let nonempty = |v: Option<String>| v.filter(|s| !s.is_empty());
         let cfg = ProxyConfig {
             id: Uuid::new_v4().to_string(),
             name: spec.name,
@@ -231,6 +277,17 @@ impl Manager {
             keepalive_secs: spec.keepalive_secs,
             idle_timeout_secs: spec.idle_timeout_secs,
             connect_timeout_secs: spec.connect_timeout_secs,
+            client_p12: nonempty(spec.client_p12),
+            client_p12_password: spec.client_p12_password,
+            client_p12_alias: spec.client_p12_alias,
+            client_p12_entry_password: spec.client_p12_entry_password,
+            override_headers: spec.override_headers,
+            server_p12: nonempty(spec.server_p12),
+            server_p12_password: spec.server_p12_password,
+            server_truststore_p12: nonempty(spec.server_truststore_p12),
+            server_truststore_password: spec.server_truststore_password,
+            mtls_required: spec.mtls_required,
+            blocklist: Vec::new(),
             enabled: false,
         };
         self.storage.save_config(&cfg)?;
@@ -259,6 +316,47 @@ impl Manager {
             cfg.keepalive_secs = spec.keepalive_secs;
             cfg.idle_timeout_secs = spec.idle_timeout_secs;
             cfg.connect_timeout_secs = spec.connect_timeout_secs;
+            cfg.override_headers = spec.override_headers;
+            cfg.mtls_required = spec.mtls_required;
+
+            // Tri-state PKCS#12 fields: keep / clear / replace.
+            match spec.client_p12 {
+                None => {}
+                Some(s) if s.is_empty() => {
+                    cfg.client_p12 = None;
+                    cfg.client_p12_password = None;
+                    cfg.client_p12_alias = None;
+                    cfg.client_p12_entry_password = None;
+                }
+                Some(s) => {
+                    cfg.client_p12 = Some(s);
+                    cfg.client_p12_password = spec.client_p12_password;
+                    cfg.client_p12_alias = spec.client_p12_alias;
+                    cfg.client_p12_entry_password = spec.client_p12_entry_password;
+                }
+            }
+            match spec.server_p12 {
+                None => {}
+                Some(s) if s.is_empty() => {
+                    cfg.server_p12 = None;
+                    cfg.server_p12_password = None;
+                }
+                Some(s) => {
+                    cfg.server_p12 = Some(s);
+                    cfg.server_p12_password = spec.server_p12_password;
+                }
+            }
+            match spec.server_truststore_p12 {
+                None => {}
+                Some(s) if s.is_empty() => {
+                    cfg.server_truststore_p12 = None;
+                    cfg.server_truststore_password = None;
+                }
+                Some(s) => {
+                    cfg.server_truststore_p12 = Some(s);
+                    cfg.server_truststore_password = spec.server_truststore_password;
+                }
+            }
             self.storage.save_config(&cfg)?;
         }
         if was_running {
@@ -277,12 +375,44 @@ impl Manager {
         Ok(())
     }
 
+    /// Build the TLS material a proxy needs before its accept loop starts.
+    fn prepare_tls(&self, runtime: &ProxyRuntime) -> Result<()> {
+        let cfg = runtime.config.lock().unwrap().clone();
+
+        let acceptor = match (cfg.protocol, cfg.server_p12.as_deref()) {
+            (Protocol::Https, Some(p12)) if !p12.is_empty() => Some(tls::acceptor_from_p12(
+                p12,
+                cfg.server_p12_password.as_deref().unwrap_or(""),
+                cfg.server_truststore_p12.as_deref(),
+                cfg.server_truststore_password.as_deref().unwrap_or(""),
+                cfg.mtls_required,
+            )?),
+            _ => None,
+        };
+        *runtime.https_acceptor.lock().unwrap() = acceptor;
+
+        let connector = match cfg.client_p12.as_deref() {
+            Some(p12) if !p12.is_empty() && cfg.protocol.is_http() => {
+                Some(Arc::new(tls::client_connector(
+                    p12,
+                    cfg.client_p12_password.as_deref().unwrap_or(""),
+                    cfg.client_p12_alias.as_deref(),
+                )?))
+            }
+            _ => None,
+        };
+        *runtime.client_connector.lock().unwrap() = connector;
+        Ok(())
+    }
+
     /// Bind the listener and spawn the accept loop for a proxy.
     pub async fn start(self: &Arc<Self>, id: &str) -> Result<()> {
         let runtime = self.runtime(id)?;
         if runtime.running.load(Ordering::SeqCst) {
             return Ok(());
         }
+        self.prepare_tls(&runtime)?;
+
         let addr = runtime.config.lock().unwrap().listen_addr.clone();
         let listener = TcpListener::bind(&addr)
             .await
@@ -319,6 +449,103 @@ impl Manager {
         Ok(())
     }
 
+    /// Abort one in-flight connection by id.
+    pub fn kill_conn(&self, proxy_id: &str, conn_id: &str) -> Result<()> {
+        let runtime = self.runtime(proxy_id)?;
+        match runtime.conns.get(conn_id) {
+            Some(entry) => {
+                entry.cancel.cancel();
+                Ok(())
+            }
+            None => bail!("connection not found (it may have already closed)"),
+        }
+    }
+
+    /// Block a source address (`IP` or `IP:port`): it is refused on every
+    /// future accept, and any matching live connections are terminated now.
+    pub fn block(&self, addr: &str) -> Result<()> {
+        let addr = addr.trim().to_string();
+        if addr.is_empty() {
+            bail!("address is required");
+        }
+        {
+            let mut bl = self.blocklist.lock().unwrap();
+            bl.insert(addr.clone());
+            self.storage.save_blocklist(&bl)?;
+        }
+        for proxy in self.proxies.iter() {
+            for conn in proxy.value().conns.iter() {
+                let src = conn.value().src_addr.as_str();
+                if src == addr || src_ip(src) == addr {
+                    conn.value().cancel.cancel();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a source address from the blocklist.
+    pub fn unblock(&self, addr: &str) -> Result<()> {
+        let mut bl = self.blocklist.lock().unwrap();
+        bl.remove(addr.trim());
+        self.storage.save_blocklist(&bl)?;
+        Ok(())
+    }
+
+    /// The current manager-wide blocklist, sorted.
+    pub fn blocklist(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.blocklist.lock().unwrap().iter().cloned().collect();
+        out.sort();
+        out
+    }
+
+    /// Block a source address on a single proxy and drop its matching live
+    /// connections on that proxy.
+    pub fn block_proxy(&self, proxy_id: &str, addr: &str) -> Result<()> {
+        let addr = addr.trim().to_string();
+        if addr.is_empty() {
+            bail!("address is required");
+        }
+        let runtime = self.runtime(proxy_id)?;
+        {
+            let mut cfg = runtime.config.lock().unwrap();
+            if !cfg.blocklist.contains(&addr) {
+                cfg.blocklist.push(addr.clone());
+            }
+            self.storage.save_config(&cfg)?;
+        }
+        for conn in runtime.conns.iter() {
+            let src = conn.value().src_addr.as_str();
+            if src == addr || src_ip(src) == addr {
+                conn.value().cancel.cancel();
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a source address from a single proxy's blocklist.
+    pub fn unblock_proxy(&self, proxy_id: &str, addr: &str) -> Result<()> {
+        let runtime = self.runtime(proxy_id)?;
+        let mut cfg = runtime.config.lock().unwrap();
+        cfg.blocklist.retain(|a| a != addr.trim());
+        self.storage.save_config(&cfg)?;
+        Ok(())
+    }
+
+    /// One proxy's blocklist, sorted.
+    pub fn proxy_blocklist(&self, proxy_id: &str) -> Result<Vec<String>> {
+        let runtime = self.runtime(proxy_id)?;
+        let mut out = runtime.config.lock().unwrap().blocklist.clone();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Whether a peer is blocked manager-wide, by full `IP:port` or bare IP.
+    fn is_blocked(&self, peer: &SocketAddr) -> bool {
+        let bl = self.blocklist.lock().unwrap();
+        bl.contains(&peer.to_string()) || bl.contains(&peer.ip().to_string())
+    }
+
     async fn accept_loop(
         manager: Arc<Self>,
         runtime: Arc<ProxyRuntime>,
@@ -330,6 +557,16 @@ impl Manager {
                 _ = token.cancelled() => break,
                 res = listener.accept() => match res {
                     Ok((stream, peer)) => {
+                        let blocked = manager.is_blocked(&peer) || {
+                            let cfg = runtime.config.lock().unwrap();
+                            cfg.blocklist.iter().any(|a| {
+                                *a == peer.to_string() || *a == peer.ip().to_string()
+                            })
+                        };
+                        if blocked {
+                            tracing::debug!("rejected blocked peer {peer}");
+                            continue;
+                        }
                         let m = manager.clone();
                         let rt = runtime.clone();
                         let t = token.clone();
@@ -343,15 +580,26 @@ impl Manager {
                                 Protocol::Socks5 => socks5::serve(m, rt, stream, peer, t).await,
                                 Protocol::Http => http::serve(m, rt, stream, peer, t).await,
                                 Protocol::Tcp => tcp::serve(m, rt, stream, peer, t).await,
+                                Protocol::Websocket => {
+                                    ws_proxy::serve(m, rt, stream, peer, t).await
+                                }
                                 Protocol::Shadowsocks => {
                                     shadowsocks::serve(m, rt, stream, peer, t).await
                                 }
-                                Protocol::Https => match m.tls.clone().accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        http::serve(m, rt, tls_stream, peer, t).await
+                                Protocol::Https => {
+                                    let acceptor = rt
+                                        .https_acceptor
+                                        .lock()
+                                        .unwrap()
+                                        .clone()
+                                        .unwrap_or_else(|| m.tls.clone());
+                                    match acceptor.accept(stream).await {
+                                        Ok(tls_stream) => {
+                                            http::serve(m, rt, tls_stream, peer, t).await
+                                        }
+                                        Err(e) => Err(anyhow!("TLS handshake failed: {e}")),
                                     }
-                                    Err(e) => Err(anyhow!("TLS handshake failed: {e}")),
-                                },
+                                }
                             };
                             if let Err(e) = result {
                                 tracing::debug!("connection from {peer} ended: {e}");
@@ -405,6 +653,17 @@ impl Manager {
                 keepalive_secs: cfg.keepalive_secs,
                 idle_timeout_secs: cfg.idle_timeout_secs,
                 connect_timeout_secs: cfg.connect_timeout_secs,
+                override_headers: cfg.override_headers.clone(),
+                has_client_p12: cfg.client_p12.is_some(),
+                client_p12_alias: cfg.client_p12_alias.clone(),
+                has_server_p12: cfg.server_p12.is_some(),
+                has_truststore: cfg.server_truststore_p12.is_some(),
+                mtls_required: cfg.mtls_required,
+                blocklist: {
+                    let mut bl = cfg.blocklist.clone();
+                    bl.sort();
+                    bl
+                },
                 total_connections: rt.total_connections.load(Ordering::Relaxed),
                 bytes_sent: rt.total_sent.load(Ordering::Relaxed) + live_sent,
                 bytes_received: rt.total_received.load(Ordering::Relaxed) + live_received,

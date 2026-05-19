@@ -4,11 +4,16 @@
 //! The handler is generic over the client stream, so it serves both the plain
 //! `http` protocol (over `TcpStream`) and the TLS-wrapped `https` protocol
 //! (over a `TlsStream`).
+//!
+//! When the proxy forwards a plain request to an `https://` destination the
+//! upstream socket is TLS-wrapped; if a PKCS#12 client identity is configured
+//! that certificate is presented, satisfying destinations that require mTLS.
 
 use crate::manager::{Manager, ProxyRuntime};
 use crate::relay;
 use anyhow::{Result, bail};
 use base64::Engine;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,26 +89,36 @@ where
         }
     }
 
-    let (connect_timeout, keepalive, idle) = {
+    let (connect_timeout, keepalive, idle, overrides) = {
         let cfg = runtime.config.lock().unwrap();
-        (cfg.connect_timeout_secs, cfg.keepalive_secs, cfg.idle_timeout_secs)
+        (
+            cfg.connect_timeout_secs,
+            cfg.keepalive_secs,
+            cfg.idle_timeout_secs,
+            cfg.override_headers.clone(),
+        )
     };
+    // Client-TLS connectors: the proxy's own PKCS#12 identity (mTLS) if set,
+    // otherwise a plain connector for ordinary `https://` destinations.
+    let client_connector = runtime.client_connector.lock().unwrap().clone();
 
     // Bytes received after the header block — pipelined body / TLS data.
     let extra: Vec<u8> = buf.split_off((head_end + 4).min(buf.len()));
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        // CONNECT <host:port> — open a raw tunnel.
+        // CONNECT <host:port> — open a raw tunnel (always plain TCP; the
+        // client performs its own end-to-end TLS through the tunnel).
         let dst = target;
-        let mut upstream = match relay::connect(&dst, connect_timeout, keepalive).await {
-            Ok(u) => u,
-            Err(e) => {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                    .await;
-                bail!("connect to {dst} failed: {e}");
-            }
-        };
+        let mut upstream =
+            match relay::connect_upstream(&dst, connect_timeout, keepalive, None).await {
+                Ok(u) => u,
+                Err(e) => {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                        .await;
+                    bail!("connect to {dst} failed: {e}");
+                }
+            };
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
@@ -125,23 +140,44 @@ where
         .await;
     } else {
         // Plain forwarding — the target is an absolute-form URI.
-        let (host, port, path) = parse_absolute_uri(&target)?;
+        let (host, port, path, https) = parse_absolute_uri(&target)?;
         let dst = format!("{host}:{port}");
-        let mut upstream = match relay::connect(&dst, connect_timeout, keepalive).await {
-            Ok(u) => u,
-            Err(e) => {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                    .await;
-                bail!("connect to {dst} failed: {e}");
-            }
+        // Reach an `https://` destination over TLS, presenting the proxy's
+        // client certificate when one is configured.
+        let tls = if https {
+            Some(
+                client_connector
+                    .as_deref()
+                    .unwrap_or(&manager.default_connector),
+            )
+        } else {
+            None
         };
-        // Rebuild the request in origin-form, dropping proxy/hop-by-hop headers.
+        let mut upstream =
+            match relay::connect_upstream(&dst, connect_timeout, keepalive, tls).await {
+                Ok(u) => u,
+                Err(e) => {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                        .await;
+                    bail!("connect to {dst} failed: {e}");
+                }
+            };
+        // Rebuild the request in origin-form, dropping proxy/hop-by-hop headers
+        // and any header that an override replaces.
+        let override_keys: HashSet<String> = overrides
+            .iter()
+            .filter(|h| !h.key.is_empty())
+            .map(|h| h.key.to_ascii_lowercase())
+            .collect();
         let mut out = format!("{method} {path} {version}\r\n");
         let mut has_host = false;
         for (k, v) in &headers {
             let lk = k.to_ascii_lowercase();
             if lk == "proxy-authorization" || lk == "proxy-connection" || lk == "connection" {
+                continue;
+            }
+            if override_keys.contains(&lk) {
                 continue;
             }
             if lk == "host" {
@@ -150,6 +186,19 @@ where
             out.push_str(k);
             out.push_str(": ");
             out.push_str(v);
+            out.push_str("\r\n");
+        }
+        // Apply the configured header overrides.
+        for h in &overrides {
+            if h.key.is_empty() {
+                continue;
+            }
+            if h.key.eq_ignore_ascii_case("host") {
+                has_host = true;
+            }
+            out.push_str(&h.key);
+            out.push_str(": ");
+            out.push_str(&h.value);
             out.push_str("\r\n");
         }
         if !has_host {
@@ -177,8 +226,9 @@ where
     Ok(())
 }
 
-/// Split `http://host[:port]/path` (or `https://...`) into its parts.
-fn parse_absolute_uri(uri: &str) -> Result<(String, u16, String)> {
+/// Split `http://host[:port]/path` (or `https://...`) into its parts; the
+/// boolean is `true` for an `https://` target.
+fn parse_absolute_uri(uri: &str) -> Result<(String, u16, String, bool)> {
     let https = uri.starts_with("https://");
     let rest = uri
         .strip_prefix("http://")
@@ -196,5 +246,5 @@ fn parse_absolute_uri(uri: &str) -> Result<(String, u16, String)> {
     if host.is_empty() {
         bail!("request is not in absolute form (not a proxy request): {uri:?}");
     }
-    Ok((host, port, path.to_string()))
+    Ok((host, port, path.to_string(), https))
 }

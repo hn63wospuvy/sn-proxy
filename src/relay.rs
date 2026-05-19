@@ -12,6 +12,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Apply a TCP keep-alive interval to a socket (no-op when `secs` is 0/`None`).
@@ -41,6 +44,90 @@ pub async fn connect(
     Ok(stream)
 }
 
+/// An upstream connection: a plain TCP socket, or one wrapped in client TLS
+/// (used by HTTP/HTTPS proxies reaching `https://` destinations).
+pub enum Upstream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// The host portion of a `host:port` (or `[ipv6]:port`) address.
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(i) = rest.find(']') {
+            return &rest[..i];
+        }
+    }
+    match addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => addr,
+    }
+}
+
+/// Connect to `addr`, optionally wrapping the socket in a client-TLS session.
+pub async fn connect_upstream(
+    addr: &str,
+    connect_timeout: Option<u64>,
+    keepalive: Option<u64>,
+    tls: Option<&TlsConnector>,
+) -> std::io::Result<Upstream> {
+    let tcp = connect(addr, connect_timeout, keepalive).await?;
+    match tls {
+        None => Ok(Upstream::Plain(tcp)),
+        Some(connector) => {
+            let host = host_of(addr).to_string();
+            let name = ServerName::try_from(host.clone()).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid TLS server name {host:?}: {e}"),
+                )
+            })?;
+            let stream = connector.connect(name, tcp).await?;
+            Ok(Upstream::Tls(Box::new(stream)))
+        }
+    }
+}
+
+impl AsyncRead for Upstream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Upstream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Upstream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => Pin::new(s).poll_write(cx, data),
+            Upstream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, data),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => Pin::new(s).poll_flush(cx),
+            Upstream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Upstream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Upstream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Resolves once the connection has transferred no bytes for `idle`.
 /// When `idle` is `None` it never resolves (idle timeout disabled).
 pub async fn idle_watchdog(entry: Arc<ConnEntry>, idle: Option<Duration>) {
@@ -65,6 +152,8 @@ pub async fn idle_watchdog(entry: Arc<ConnEntry>, idle: Option<Duration>) {
 ///
 /// The `relay` closure receives the live [`ConnEntry`] and is responsible for
 /// updating its `bytes_sent` / `bytes_received` counters as it transfers data.
+/// The relay is aborted if the connection's [`ConnEntry::cancel`] token fires,
+/// which is how the admin "terminate connection" / "block IP" actions work.
 pub async fn tracked<F, Fut>(
     storage: &Arc<Storage>,
     runtime: &Arc<ProxyRuntime>,
@@ -83,12 +172,17 @@ pub async fn tracked<F, Fut>(
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
         started_at: now_ms(),
+        cancel: CancellationToken::new(),
     });
     runtime.conns.insert(conn_id.clone(), entry.clone());
     runtime.total_connections.fetch_add(1, Ordering::Relaxed);
     let proxy_id = runtime.config.lock().unwrap().id.clone();
 
-    relay(entry.clone()).await;
+    let cancel = entry.cancel.clone();
+    tokio::select! {
+        _ = relay(entry.clone()) => {}
+        _ = cancel.cancelled() => {}
+    }
 
     runtime.conns.remove(&conn_id);
     let sent = entry.bytes_sent.load(Ordering::Relaxed);

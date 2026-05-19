@@ -17,6 +17,7 @@ mod storage;
 mod tcp;
 mod tls;
 mod ws;
+mod ws_proxy;
 
 use anyhow::{Context, Result, anyhow};
 use manager::{Admin, AdminAuth};
@@ -229,9 +230,13 @@ async fn main() -> Result<()> {
 
     let config = resolve_config()?;
     tracing::info!("Using data dir: {}", &config.data_dir);
+    // Install the process-wide rustls crypto provider before any TLS config
+    // is built.
+    tls::install_provider();
     // Persistence, TLS for HTTPS proxies, and the web-admin login.
     let storage = storage::Storage::open(&config.data_dir)?;
     let tls = tls::acceptor(config.tls_cert.as_deref(), config.tls_key.as_deref())?;
+    let default_connector = tls::plain_connector();
     let admin_count = config.admins.len();
     let admin = AdminAuth::new(config.admins);
     if admin.required() {
@@ -239,7 +244,7 @@ async fn main() -> Result<()> {
     } else {
         tracing::warn!("web admin login is DISABLED (set admin_user/admin_password in config)");
     }
-    let manager = manager::Manager::bootstrap(storage, admin, tls).await?;
+    let manager = manager::Manager::bootstrap(storage, admin, tls, default_connector).await?;
 
     // Broadcast a fresh snapshot to websocket clients once a second.
     {

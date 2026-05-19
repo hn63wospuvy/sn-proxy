@@ -1,5 +1,6 @@
 //! Realtime monitoring payloads broadcast to websocket clients.
 
+use crate::model::HeaderOverride;
 use serde::Serialize;
 
 /// A single live connection currently being relayed by a proxy.
@@ -32,6 +33,20 @@ pub struct ProxySnapshot {
     pub keepalive_secs: Option<u64>,
     pub idle_timeout_secs: Option<u64>,
     pub connect_timeout_secs: Option<u64>,
+    /// HTTP request-header overrides (HTTP/HTTPS only).
+    pub override_headers: Vec<HeaderOverride>,
+    /// Whether a client mTLS PKCS#12 identity is configured.
+    pub has_client_p12: bool,
+    /// Alias of the client keystore entry, when one was specified.
+    pub client_p12_alias: Option<String>,
+    /// Whether a per-proxy HTTPS server PKCS#12 keystore is configured.
+    pub has_server_p12: bool,
+    /// Whether a client-certificate truststore is configured.
+    pub has_truststore: bool,
+    /// Whether the HTTPS listener requires client certificates (mTLS).
+    pub mtls_required: bool,
+    /// Source addresses blocked on this proxy specifically.
+    pub blocklist: Vec<String>,
     pub total_connections: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,

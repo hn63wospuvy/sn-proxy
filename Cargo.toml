@@ -16,6 +16,7 @@ getrandom = "0.4.2"
 hkdf = "0.13.0"
 ipnet = "2.12.0"
 md-5 = "0.11.0"
+p12-keystore = "0.1"
 rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"] }
 rocksdb = "0.24.0"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }

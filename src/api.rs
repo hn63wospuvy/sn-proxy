@@ -1,7 +1,7 @@
 //! Axum HTTP API and websocket route for the web admin.
 
 use crate::manager::{Manager, ProxySpec};
-use crate::model::{BasicAuth, Protocol};
+use crate::model::{BasicAuth, HeaderOverride, Protocol};
 use crate::ws;
 use axum::{
     Json, Router,
@@ -25,6 +25,17 @@ pub fn router(manager: Arc<Manager>) -> Router {
         .route("/api/proxies/{id}/start", post(start_proxy))
         .route("/api/proxies/{id}/stop", post(stop_proxy))
         .route("/api/proxies/{id}/history", get(history).delete(clear_history))
+        .route("/api/proxies/{id}/conns/{cid}/kill", post(kill_conn))
+        .route(
+            "/api/proxies/{id}/blocklist",
+            get(list_proxy_blocklist)
+                .post(add_proxy_block)
+                .delete(remove_proxy_block),
+        )
+        .route(
+            "/api/blocklist",
+            get(list_blocklist).post(add_block).delete(remove_block),
+        )
         .route("/ws", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(manager.clone(), require_auth));
 
@@ -151,12 +162,36 @@ struct ProxyForm {
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
     connect_timeout_secs: Option<u64>,
+    // Client mTLS toward the destination (HTTP/HTTPS). The PKCS#12 fields are
+    // tri-state: omitted = keep, "" = clear, base64 = replace.
+    #[serde(default)]
+    client_p12: Option<String>,
+    #[serde(default)]
+    client_p12_password: Option<String>,
+    #[serde(default)]
+    client_p12_alias: Option<String>,
+    #[serde(default)]
+    client_p12_entry_password: Option<String>,
+    #[serde(default)]
+    override_headers: Option<Vec<HeaderOverride>>,
+    // HTTPS listener TLS material (same tri-state convention).
+    #[serde(default)]
+    server_p12: Option<String>,
+    #[serde(default)]
+    server_p12_password: Option<String>,
+    #[serde(default)]
+    server_truststore_p12: Option<String>,
+    #[serde(default)]
+    server_truststore_password: Option<String>,
+    #[serde(default)]
+    mtls_required: bool,
 }
 
 impl ProxyForm {
     fn into_spec(self) -> ProxySpec {
         // Treat 0 as "unset" for the optional numeric tuning knobs.
         let nonzero = |v: Option<u64>| v.filter(|n| *n > 0);
+        let blank = |v: Option<String>| v.filter(|s| !s.is_empty());
         ProxySpec {
             name: self.name,
             protocol: self.protocol,
@@ -168,6 +203,21 @@ impl ProxyForm {
             keepalive_secs: nonzero(self.keepalive_secs),
             idle_timeout_secs: nonzero(self.idle_timeout_secs),
             connect_timeout_secs: nonzero(self.connect_timeout_secs),
+            client_p12: self.client_p12,
+            client_p12_password: blank(self.client_p12_password),
+            client_p12_alias: blank(self.client_p12_alias),
+            client_p12_entry_password: blank(self.client_p12_entry_password),
+            override_headers: self
+                .override_headers
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|h| !h.key.trim().is_empty())
+                .collect(),
+            server_p12: self.server_p12,
+            server_p12_password: blank(self.server_p12_password),
+            server_truststore_p12: self.server_truststore_p12,
+            server_truststore_password: blank(self.server_truststore_password),
+            mtls_required: self.mtls_required,
         }
     }
 }
@@ -210,6 +260,75 @@ async fn start_proxy(State(m): State<Arc<Manager>>, Path(id): Path<String>) -> R
 
 async fn stop_proxy(State(m): State<Arc<Manager>>, Path(id): Path<String>) -> Response {
     match m.stop(&id) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Terminate one in-flight connection.
+async fn kill_conn(
+    State(m): State<Arc<Manager>>,
+    Path((id, cid)): Path<(String, String)>,
+) -> Response {
+    match m.kill_conn(&id, &cid) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct BlockForm {
+    addr: String,
+}
+
+/// List every blocked source address.
+async fn list_blocklist(State(m): State<Arc<Manager>>) -> Response {
+    Json(m.blocklist()).into_response()
+}
+
+/// Block a source address (`IP` or `IP:port`) and drop its live connections.
+async fn add_block(State(m): State<Arc<Manager>>, Json(form): Json<BlockForm>) -> Response {
+    match m.block(&form.addr) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Remove a source address from the blocklist.
+async fn remove_block(State(m): State<Arc<Manager>>, Json(form): Json<BlockForm>) -> Response {
+    match m.unblock(&form.addr) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// List one proxy's own blocklist.
+async fn list_proxy_blocklist(State(m): State<Arc<Manager>>, Path(id): Path<String>) -> Response {
+    match m.proxy_blocklist(&id) {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Block a source address on one proxy and drop its matching connections.
+async fn add_proxy_block(
+    State(m): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(form): Json<BlockForm>,
+) -> Response {
+    match m.block_proxy(&id, &form.addr) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Remove a source address from one proxy's blocklist.
+async fn remove_proxy_block(
+    State(m): State<Arc<Manager>>,
+    Path(id): Path<String>,
+    Json(form): Json<BlockForm>,
+) -> Response {
+    match m.unblock_proxy(&id, &form.addr) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => fail(e),
     }

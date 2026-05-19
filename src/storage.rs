@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 const CFG_PREFIX: &str = "cfg:";
 const HIST_PREFIX: &str = "hist:";
+const BLOCKLIST_KEY: &str = "meta:blocklist";
 
 /// Thin wrapper over a single RocksDB instance.
 pub struct Storage {
@@ -84,6 +85,21 @@ impl Storage {
             seen += 1;
         }
         Ok(out)
+    }
+
+    /// Persist the set of blocked source addresses.
+    pub fn save_blocklist(&self, blocked: &std::collections::HashSet<String>) -> Result<()> {
+        self.db
+            .put(BLOCKLIST_KEY.as_bytes(), serde_json::to_vec(blocked)?)?;
+        Ok(())
+    }
+
+    /// Load the persisted set of blocked source addresses.
+    pub fn load_blocklist(&self) -> Result<std::collections::HashSet<String>> {
+        match self.db.get(BLOCKLIST_KEY.as_bytes())? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            None => Ok(std::collections::HashSet::new()),
+        }
     }
 
     /// Delete all history belonging to a proxy (used when the proxy is removed).

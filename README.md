@@ -9,17 +9,41 @@ realtime web admin. Everything runs on a single Tokio runtime.
 |---------------|----------------------------------------------------------------|
 | `socks5`      | RFC 1928, optional username/password auth (RFC 1929)           |
 | `http`        | `CONNECT` tunnelling + plain HTTP forwarding, optional Basic auth |
-| `https`       | HTTP proxy wrapped in TLS (config cert or auto self-signed)    |
+| `https`       | HTTP proxy wrapped in TLS (config cert, per-proxy PKCS#12, or auto self-signed) |
 | `shadowsocks` | AEAD (`aes-256-gcm`, `aes-128-gcm`, `chacha20-ietf-poly1305`)  |
 | `tcp`         | Plain TCP forwarder to a fixed `host:port` destination         |
+| `websocket`   | WebSocket tunnel (RFC 6455) to a fixed `host:port` destination |
 
 Each proxy also has optional advanced tuning: **TCP keep-alive** interval,
 **idle timeout** (drop connections with no traffic), and **connect timeout**
 (when dialing the destination).
 
+### HTTP / HTTPS extras
+
+`http` and `https` proxies support extra configuration, all editable from the
+web admin:
+
+- **Header overrides** — inject/replace request headers (key/value pairs) on
+  plain-forwarded HTTP requests.
+- **Client mTLS** — upload a PKCS#12 (`.p12`/`.pfx`) client identity (with
+  password, and optional entry alias / entry password). When forwarding to an
+  `https://` destination that identity is presented, satisfying servers that
+  require mutual TLS.
+- **HTTPS listener TLS** — an `https` proxy can use its own PKCS#12 keystore
+  for the listener certificate instead of the global one, and can require
+  connecting clients to present a certificate (**mTLS**) validated against an
+  uploaded PKCS#12 truststore.
+
+### Connection control
+
+- **Terminate** any in-flight connection from the live table.
+- **Block** a source `IP` or `IP:port`: it is refused at accept time on every
+  proxy, and matching live connections are dropped immediately. The blocklist
+  is persisted and managed from the "Blocklist" panel.
+
 ## Features
 
-- **Four proxy protocols** — pick one per proxy instance (see table above)
+- **Six proxy protocols** — pick one per proxy instance (see table above)
 - **Web admin** to create, edit, start/stop and delete multiple proxies — each
   with its own protocol, listen address and credentials
 - **Realtime monitoring** over a websocket (built on
@@ -104,6 +128,10 @@ curl -x https://127.0.0.1:1082 --proxy-insecure https://example.com
 | `POST   /api/proxies/{id}/stop`      | Stop a proxy                      |
 | `GET    /api/proxies/{id}/history`   | History page (`?offset=&limit=`)  |
 | `DELETE /api/proxies/{id}/history`   | Delete all history for a proxy    |
+| `POST   /api/proxies/{id}/conns/{cid}/kill` | Terminate one live connection |
+| `GET    /api/blocklist`              | List blocked source addresses     |
+| `POST   /api/blocklist`              | Block an address (`{"addr": …}`)  |
+| `DELETE /api/blocklist`              | Unblock an address (`{"addr": …}`) |
 | `GET    /ws`                         | Websocket monitoring feed         |
 
 ## Architecture
@@ -111,10 +139,11 @@ curl -x https://127.0.0.1:1082 --proxy-insecure https://example.com
 | Module           | Responsibility                                          |
 |------------------|---------------------------------------------------------|
 | `socks5.rs`      | SOCKS5 handshake, auth, CONNECT relay                   |
-| `http.rs`        | HTTP/HTTPS proxy (CONNECT + forwarding, Basic auth)     |
+| `http.rs`        | HTTP/HTTPS proxy (CONNECT, forwarding, header overrides, client mTLS) |
 | `shadowsocks.rs` | Shadowsocks AEAD server                                 |
 | `tcp.rs`         | Plain TCP forwarder                                     |
-| `tls.rs`         | Cert loading / self-signed TLS acceptor for HTTPS       |
+| `ws_proxy.rs`    | WebSocket tunnelling proxy (RFC 6455)                   |
+| `tls.rs`         | TLS acceptors/connectors: PEM, self-signed and PKCS#12  |
 | `relay.rs`       | Connection tracking, byte counting, keep-alive, timeouts |
 | `manager.rs`     | Proxy lifecycle, protocol dispatch, connection registry |
 | `storage.rs`     | RocksDB persistence (configs + history)                 |

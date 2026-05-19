@@ -17,6 +17,8 @@ pub enum Protocol {
     Shadowsocks,
     /// Plain TCP forwarder to a fixed destination.
     Tcp,
+    /// WebSocket tunnelling proxy to a fixed destination.
+    Websocket,
 }
 
 impl Protocol {
@@ -27,7 +29,14 @@ impl Protocol {
             Protocol::Https => "https",
             Protocol::Shadowsocks => "shadowsocks",
             Protocol::Tcp => "tcp",
+            Protocol::Websocket => "websocket",
         }
+    }
+
+    /// Whether the protocol is HTTP-family (`http` or `https`), the only
+    /// protocols that support header overrides and client mTLS.
+    pub fn is_http(&self) -> bool {
+        matches!(self, Protocol::Http | Protocol::Https)
     }
 }
 
@@ -36,6 +45,13 @@ impl Protocol {
 pub struct BasicAuth {
     pub username: String,
     pub password: String,
+}
+
+/// A single request header injected/replaced when forwarding plain HTTP.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HeaderOverride {
+    pub key: String,
+    pub value: String,
 }
 
 fn default_true() -> bool {
@@ -53,7 +69,7 @@ pub struct ProxyConfig {
     pub protocol: Protocol,
     /// Address the proxy listens on, e.g. `0.0.0.0:1080`.
     pub listen_addr: String,
-    /// Username/password auth — used by SOCKS5, HTTP and HTTPS.
+    /// Username/password auth — used by SOCKS5, HTTP, HTTPS and WebSocket.
     #[serde(default)]
     pub auth: Option<BasicAuth>,
     /// Shadowsocks cipher, e.g. `aes-256-gcm` (Shadowsocks only).
@@ -62,7 +78,7 @@ pub struct ProxyConfig {
     /// Shadowsocks password / key material (Shadowsocks only).
     #[serde(default)]
     pub ss_password: Option<String>,
-    /// Fixed `host:port` destination for the TCP forwarder (Tcp only).
+    /// Fixed `host:port` destination for the TCP / WebSocket forwarder.
     #[serde(default)]
     pub forward_to: Option<String>,
     /// TCP keep-alive interval in seconds (`None`/0 = off).
@@ -75,6 +91,49 @@ pub struct ProxyConfig {
     /// Timeout in seconds when dialing the destination (`None`/0 = off).
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    // --- HTTP/HTTPS: client-side mutual TLS toward the destination ---
+    /// PKCS#12 client identity (base64-encoded `.p12` bytes) presented to
+    /// upstream servers that require mutual TLS.
+    #[serde(default)]
+    pub client_p12: Option<String>,
+    /// Password protecting `client_p12`.
+    #[serde(default)]
+    pub client_p12_password: Option<String>,
+    /// Alias of the keystore entry to use (first private key when empty).
+    #[serde(default)]
+    pub client_p12_alias: Option<String>,
+    /// Per-entry password, when the keystore uses one (rarely needed).
+    #[serde(default)]
+    pub client_p12_entry_password: Option<String>,
+    /// Request headers injected/replaced when forwarding plain HTTP.
+    #[serde(default)]
+    pub override_headers: Vec<HeaderOverride>,
+
+    // --- HTTPS listener: server-side TLS and optional client mTLS ---
+    /// PKCS#12 keystore (base64) providing the TLS server certificate and key
+    /// for an HTTPS listener. Falls back to the global certificate when empty.
+    #[serde(default)]
+    pub server_p12: Option<String>,
+    /// Password protecting `server_p12`.
+    #[serde(default)]
+    pub server_p12_password: Option<String>,
+    /// PKCS#12 truststore (base64) of CA certificates that validate client
+    /// certificates when mTLS is required.
+    #[serde(default)]
+    pub server_truststore_p12: Option<String>,
+    /// Password protecting `server_truststore_p12`.
+    #[serde(default)]
+    pub server_truststore_password: Option<String>,
+    /// Require connecting clients to present a valid certificate (mutual TLS).
+    #[serde(default)]
+    pub mtls_required: bool,
+
+    /// Per-proxy blocked source addresses (`IP` or `IP:port`). Refused at
+    /// accept time in addition to the manager-wide blocklist.
+    #[serde(default)]
+    pub blocklist: Vec<String>,
+
     /// Whether the proxy should be running.
     #[serde(default = "default_true")]
     pub enabled: bool,

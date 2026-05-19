@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>sn-proxy · SOCKS5 Admin</title>
+<title>sn-proxy · Admin</title>
 <style>
   :root {
     --bg: #0e1117; --panel: #161b22; --panel2: #1c2230; --border: #2a313c;
@@ -44,7 +44,7 @@
   }
   .proxy-head {
     display: flex; align-items: center; gap: 12px;
-    padding: 14px 18px; background: var(--panel2);
+    padding: 14px 18px; background: var(--panel2); flex-wrap: wrap;
   }
   .proxy-head .name { font-size: 15px; font-weight: 600; }
   .proxy-head .addr { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; }
@@ -76,8 +76,8 @@
   .modal-bg.show { display: flex; }
   .modal {
     background: var(--panel); border: 1px solid var(--border);
-    border-radius: 10px; width: 480px; max-width: 92vw;
-    max-height: 86vh; overflow: auto;
+    border-radius: 10px; width: 520px; max-width: 92vw;
+    max-height: 88vh; overflow: auto;
   }
   .modal h2 { padding: 16px 20px; font-size: 16px; border-bottom: 1px solid var(--border); }
   .modal-body { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
@@ -86,6 +86,8 @@
     width: 100%; font: inherit; padding: 8px 10px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--bg); color: var(--text);
   }
+  input[type=checkbox] { width: auto; }
+  input[type=file] { padding: 6px 8px; font-size: 12px; }
   .badge.proto { background: rgba(59,130,246,.16); color: var(--accent); }
   .modal-foot {
     display: flex; justify-content: flex-end; gap: 9px;
@@ -93,6 +95,23 @@
   }
   .err { color: var(--bad); font-size: 12px; min-height: 16px; }
   .hint { font-size: 11px; color: var(--muted); }
+  .section { border-top: 1px solid var(--border); padding-top: 12px; }
+  .section-title {
+    font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .05em; margin-bottom: 8px;
+  }
+  .hdr-row { display: flex; gap: 8px; margin-bottom: 6px; }
+  .hdr-row input { flex: 1; }
+  .hdr-row button { flex: none; }
+  .row2 { display: flex; gap: 10px; }
+  .row2 > div { flex: 1; }
+  .check-line { display: flex; align-items: center; gap: 8px; }
+  .check-line label { margin: 0; }
+  .bl-row {
+    display: flex; align-items: center; gap: 10px; padding: 8px 0;
+    border-top: 1px solid var(--border); font-family: ui-monospace, monospace;
+    font-size: 13px;
+  }
 </style>
 </head>
 <body>
@@ -101,6 +120,7 @@
   <span class="ws-status"><span class="dot" id="wsDot"></span><span id="wsText">connecting…</span></span>
   <div class="spacer"></div>
   <button id="logoutBtn" style="display:none" onclick="logout()">Logout</button>
+  <button onclick="openBlock()">Blocklist</button>
   <button class="primary" onclick="openForm()">+ New Proxy</button>
 </header>
 <main id="list"></main>
@@ -134,6 +154,7 @@
           <option value="https">HTTPS (TLS)</option>
           <option value="shadowsocks">Shadowsocks</option>
           <option value="tcp">TCP forwarder</option>
+          <option value="websocket">WebSocket tunnel</option>
         </select>
       </div>
       <div>
@@ -141,13 +162,13 @@
         <input id="fAddr" placeholder="0.0.0.0:1080" />
         <div class="hint">host:port the proxy binds to</div>
       </div>
-      <!-- tcp forwarder destination -->
+      <!-- tcp / websocket forwarder destination -->
       <div id="rowForward" style="display:none;">
         <label>Forward to</label>
         <input id="fForward" placeholder="10.0.0.5:5432" />
         <div class="hint">every connection is forwarded to this host:port</div>
       </div>
-      <!-- username/password auth: socks5, http, https -->
+      <!-- username/password auth: socks5, http, https, websocket -->
       <div id="rowUser">
         <label>Username (optional — leave blank to disable auth)</label>
         <input id="fUser" placeholder="" autocomplete="off" />
@@ -162,13 +183,51 @@
         </select>
       </div>
       <div id="rowPass"><label id="lblPass">Password</label><input id="fPass" type="text" placeholder="" autocomplete="off" /></div>
+
+      <!-- HTTP/HTTPS: header overrides + client mTLS -->
+      <div id="secHttp" class="section" style="display:none;">
+        <div class="section-title">Override request headers</div>
+        <div id="hdrList"></div>
+        <button type="button" class="tiny" onclick="addHeaderRow()">+ Add header</button>
+        <div class="hint" style="margin-top:4px;">Applied to plain-forwarded HTTP requests; an override replaces any header of the same name.</div>
+
+        <div class="section-title" style="margin-top:16px;">Client certificate (mTLS to destination)</div>
+        <div class="hint" id="clientP12Status"></div>
+        <div><label>Client PKCS#12 file (.p12 / .pfx)</label><input type="file" id="fClientP12" accept=".p12,.pfx" /></div>
+        <div class="row2">
+          <div><label>p12 password</label><input id="fClientP12Pass" type="password" autocomplete="off" /></div>
+          <div><label>Entry alias (optional)</label><input id="fClientP12Alias" autocomplete="off" /></div>
+        </div>
+        <div><label>Entry password (optional)</label><input id="fClientP12EntryPass" type="password" autocomplete="off" /></div>
+        <button type="button" class="tiny danger" style="margin-top:6px;" onclick="clearP12('client')">Remove client certificate</button>
+      </div>
+
+      <!-- HTTPS listener TLS -->
+      <div id="secServerTls" class="section" style="display:none;">
+        <div class="section-title">HTTPS listener certificate (PKCS#12)</div>
+        <div class="hint" id="serverP12Status"></div>
+        <div><label>Server keystore (.p12 / .pfx)</label><input type="file" id="fServerP12" accept=".p12,.pfx" /></div>
+        <div><label>Keystore password</label><input id="fServerP12Pass" type="password" autocomplete="off" /></div>
+        <button type="button" class="tiny danger" style="margin-top:6px;" onclick="clearP12('server')">Use global certificate</button>
+        <div class="check-line" style="margin-top:12px;">
+          <input type="checkbox" id="fMtls" onchange="onMtlsChange()" />
+          <label for="fMtls">Require client certificates (mutual TLS)</label>
+        </div>
+        <div id="rowTruststore" style="display:none; margin-top:6px;">
+          <div class="hint" id="truststoreStatus"></div>
+          <div><label>Truststore (.p12 / .pfx) — client CA certificates</label><input type="file" id="fTruststore" accept=".p12,.pfx" /></div>
+          <div><label>Truststore password</label><input id="fTruststorePass" type="password" autocomplete="off" /></div>
+          <button type="button" class="tiny danger" style="margin-top:6px;" onclick="clearP12('truststore')">Remove truststore</button>
+        </div>
+      </div>
+
       <!-- advanced settings (all protocols) -->
-      <div style="border-top:1px solid var(--border); padding-top:12px;">
-        <div class="hint" style="margin-bottom:8px; text-transform:uppercase; letter-spacing:.05em;">Advanced (0 = off)</div>
-        <div style="display:flex; gap:10px;">
-          <div style="flex:1;"><label>Keep-alive (s)</label><input id="fKeepalive" type="number" min="0" placeholder="0" /></div>
-          <div style="flex:1;"><label>Idle timeout (s)</label><input id="fIdle" type="number" min="0" placeholder="0" /></div>
-          <div style="flex:1;"><label>Connect timeout (s)</label><input id="fConnTimeout" type="number" min="0" placeholder="0" /></div>
+      <div class="section">
+        <div class="section-title">Advanced (0 = off)</div>
+        <div class="row2">
+          <div><label>Keep-alive (s)</label><input id="fKeepalive" type="number" min="0" placeholder="0" /></div>
+          <div><label>Idle timeout (s)</label><input id="fIdle" type="number" min="0" placeholder="0" /></div>
+          <div><label>Connect timeout (s)</label><input id="fConnTimeout" type="number" min="0" placeholder="0" /></div>
         </div>
       </div>
       <div class="err" id="formErr"></div>
@@ -205,12 +264,34 @@
   </div>
 </div>
 
+<!-- blocklist modal -->
+<div class="modal-bg" id="blockModal">
+  <div class="modal" style="width: 440px;">
+    <h2 id="blTitle">Blocked source addresses</h2>
+    <div class="modal-body">
+      <div class="hdr-row">
+        <input id="blAddr" placeholder="1.2.3.4  or  1.2.3.4:5678" />
+        <button class="primary" onclick="addBlock()">Block</button>
+      </div>
+      <div class="hint" id="blScopeHint"></div>
+      <div id="blList"></div>
+      <div class="err" id="blErr"></div>
+    </div>
+    <div class="modal-foot">
+      <button onclick="closeBlock()">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 let editId = null;          // proxy id being edited, null = create
 let latest = [];            // last snapshot
 const connsExpanded = new Set(); // proxy ids whose full connection list is shown
 const CONN_COLLAPSE = 3;    // collapse active-connection tables longer than this
+
+// PKCS#12 tri-state flags: true once the user clicked "remove".
+let clientP12Cleared = false, serverP12Cleared = false, truststoreCleared = false;
 
 function fmtBytes(n) {
   if (n < 1024) return n + " B";
@@ -227,6 +308,12 @@ function fmtDuration(ms) {
 function fmtTime(ms) { return new Date(ms).toLocaleString(); }
 function esc(s) {
   return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+// IP portion of a "host:port" / "[ipv6]:port" address.
+function ipOf(addr) {
+  if (addr.startsWith("[")) { const i = addr.indexOf("]"); if (i > 0) return addr.slice(1, i); }
+  const i = addr.lastIndexOf(":");
+  return i > 0 ? addr.slice(0, i) : addr;
 }
 
 // ---- rendering ----
@@ -249,7 +336,12 @@ function render(proxies) {
         <td>${fmtBytes(c.bytes_sent)}</td>
         <td>${fmtBytes(c.bytes_received)}</td>
         <td>${fmtDuration(now - c.started_at)}</td>
+        <td><div class="row-actions">
+          <button class="tiny danger" onclick="killConn('${p.id}','${c.id}')">Kill</button>
+          <button class="tiny" onclick="blockSrc('${esc(ipOf(c.src_addr))}')">Block IP</button>
+        </div></td>
       </tr>`).join("");
+    const httpish = p.protocol === "http" || p.protocol === "https";
     return `
     <div class="proxy">
       <div class="proxy-head">
@@ -259,14 +351,20 @@ function render(proxies) {
         <span class="badge ${p.running ? "run" : "stop"}">${p.running ? "RUNNING" : "STOPPED"}</span>
         ${p.protocol === "shadowsocks"
           ? `<span class="badge auth">${esc(p.ss_method || "")}</span>`
-          : p.protocol === "tcp"
+          : (p.protocol === "tcp" || p.protocol === "websocket")
           ? `<span class="badge auth">→ ${esc(p.forward_to || "")}</span>`
           : (p.auth_enabled ? `<span class="badge auth">AUTH: ${esc(p.auth_username || "")}</span>` : "")}
+        ${httpish && p.has_client_p12 ? `<span class="badge auth">CLIENT-CERT</span>` : ""}
+        ${p.protocol === "https" && p.mtls_required ? `<span class="badge auth">mTLS</span>` : ""}
+        ${httpish && p.override_headers && p.override_headers.length
+          ? `<span class="badge auth">${p.override_headers.length} HDR</span>` : ""}
         <div class="spacer"></div>
         <div class="row-actions">
           ${p.running
             ? `<button class="tiny" onclick="act('${p.id}','stop')">Stop</button>`
             : `<button class="tiny primary" onclick="act('${p.id}','start')">Start</button>`}
+          <button class="tiny" onclick="openProxyBlock('${p.id}','${esc(p.name)}')">Blocklist${
+            p.blocklist && p.blocklist.length ? ` (${p.blocklist.length})` : ""}</button>
           <button class="tiny" onclick="openHist('${p.id}','${esc(p.name)}')">History</button>
           <button class="tiny" onclick="editProxy('${p.id}')">Edit</button>
           <button class="tiny danger" onclick="delProxy('${p.id}','${esc(p.name)}')">Delete</button>
@@ -282,7 +380,7 @@ function render(proxies) {
       <table>
         <thead><tr>
           <th class="mono">Source IP</th><th class="mono">Destination</th>
-          <th>Sent</th><th>Received</th><th>Duration</th>
+          <th>Sent</th><th>Received</th><th>Duration</th><th>Actions</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -320,8 +418,6 @@ function connectWS() {
 }
 
 // ---- API actions ----
-// Pull a fresh snapshot over REST so the UI updates immediately after a
-// mutation, instead of waiting for the next 1s websocket snapshot.
 async function refresh() {
   try { render(await fetch("/api/proxies").then(r => r.json())); } catch (e) {}
 }
@@ -335,28 +431,118 @@ async function delProxy(id, name) {
   await fetch(`/api/proxies/${id}`, { method: "DELETE" });
   refresh();
 }
+async function killConn(pid, cid) {
+  await fetch(`/api/proxies/${pid}/conns/${cid}/kill`, { method: "POST" });
+  refresh();
+}
+async function blockSrc(ip) {
+  if (!confirm(`Block ${ip} from every proxy and drop its connections?`)) return;
+  const r = await fetch("/api/blocklist", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ addr: ip }),
+  });
+  if (!r.ok) alert((await r.json().catch(() => ({}))).error || "block failed");
+  refresh();
+}
 
 // ---- create / edit form ----
-// Show username/password for socks5/http/https, cipher for shadowsocks.
 function onProtoChange() {
   const proto = $("fProto").value;
   const ss = proto === "shadowsocks";
   const tcp = proto === "tcp";
+  const ws = proto === "websocket";
+  const http = proto === "http" || proto === "https";
   $("rowUser").style.display = (ss || tcp) ? "none" : "";
   $("rowCipher").style.display = ss ? "" : "none";
-  $("rowForward").style.display = tcp ? "" : "none";
+  $("rowForward").style.display = (tcp || ws) ? "" : "none";
   $("rowPass").style.display = tcp ? "none" : "";
+  $("secHttp").style.display = http ? "" : "none";
+  $("secServerTls").style.display = (proto === "https") ? "" : "none";
   $("lblPass").textContent = ss ? "Password (required)" : "Password";
+}
+function onMtlsChange() {
+  $("rowTruststore").style.display = $("fMtls").checked ? "" : "none";
+}
+
+// Add a key/value override-header row to the form.
+function addHeaderRow(key = "", value = "") {
+  const div = document.createElement("div");
+  div.className = "hdr-row";
+  div.innerHTML =
+    `<input class="hdr-k" placeholder="Header-Name" value="${esc(key)}" />` +
+    `<input class="hdr-v" placeholder="value" value="${esc(value)}" />` +
+    `<button type="button" class="tiny danger" onclick="this.parentElement.remove()">✕</button>`;
+  $("hdrList").appendChild(div);
+}
+function collectHeaders() {
+  return [...document.querySelectorAll("#hdrList .hdr-row")].map(r => ({
+    key: r.querySelector(".hdr-k").value.trim(),
+    value: r.querySelector(".hdr-v").value,
+  })).filter(h => h.key);
+}
+
+// Mark a PKCS#12 field for removal.
+function clearP12(which) {
+  if (which === "client") {
+    clientP12Cleared = true; $("fClientP12").value = "";
+    $("fClientP12Pass").value = ""; $("fClientP12Alias").value = "";
+    $("fClientP12EntryPass").value = "";
+    $("clientP12Status").textContent = "Client certificate will be removed on save.";
+  } else if (which === "server") {
+    serverP12Cleared = true; $("fServerP12").value = ""; $("fServerP12Pass").value = "";
+    $("serverP12Status").textContent = "Listener will fall back to the global certificate on save.";
+  } else if (which === "truststore") {
+    truststoreCleared = true; $("fTruststore").value = ""; $("fTruststorePass").value = "";
+    $("truststoreStatus").textContent = "Truststore will be removed on save.";
+  }
+}
+
+// Read a File into a base64 string.
+function fileToB64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const bytes = new Uint8Array(r.result);
+      let s = "";
+      for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+      resolve(btoa(s));
+    };
+    r.onerror = reject;
+    r.readAsArrayBuffer(file);
+  });
+}
+// Resolve a PKCS#12 field to its tri-state value: base64 (new file),
+// "" (cleared) or null (keep the stored value).
+async function p12Value(inputId, cleared) {
+  const f = $(inputId).files[0];
+  if (f) return await fileToB64(f);
+  if (cleared) return "";
+  return null;
+}
+
+function resetForm() {
+  clientP12Cleared = serverP12Cleared = truststoreCleared = false;
+  $("fName").value = ""; $("fAddr").value = "0.0.0.0:1080";
+  $("fProto").value = "socks5"; $("fCipher").value = "aes-256-gcm";
+  $("fUser").value = ""; $("fPass").value = ""; $("fForward").value = "";
+  $("fKeepalive").value = ""; $("fIdle").value = ""; $("fConnTimeout").value = "";
+  $("hdrList").innerHTML = "";
+  $("fClientP12").value = ""; $("fClientP12Pass").value = "";
+  $("fClientP12Alias").value = ""; $("fClientP12EntryPass").value = "";
+  $("clientP12Status").textContent = "";
+  $("fServerP12").value = ""; $("fServerP12Pass").value = "";
+  $("serverP12Status").textContent = "";
+  $("fMtls").checked = false;
+  $("fTruststore").value = ""; $("fTruststorePass").value = "";
+  $("truststoreStatus").textContent = "";
+  $("formErr").textContent = "";
+  onMtlsChange();
 }
 function openForm() {
   editId = null;
   $("formTitle").textContent = "New Proxy";
   $("formSave").textContent = "Create";
-  $("fName").value = ""; $("fAddr").value = "0.0.0.0:1080";
-  $("fProto").value = "socks5"; $("fCipher").value = "aes-256-gcm";
-  $("fUser").value = ""; $("fPass").value = ""; $("fForward").value = "";
-  $("fKeepalive").value = ""; $("fIdle").value = ""; $("fConnTimeout").value = "";
-  $("formErr").textContent = "";
+  resetForm();
   onProtoChange();
   $("formModal").classList.add("show");
 }
@@ -366,20 +552,32 @@ function editProxy(id) {
   editId = id;
   $("formTitle").textContent = "Edit Proxy";
   $("formSave").textContent = "Save";
+  resetForm();
   $("fName").value = p.name; $("fAddr").value = p.listen_addr;
   $("fProto").value = p.protocol || "socks5";
   $("fCipher").value = p.ss_method || "aes-256-gcm";
-  $("fUser").value = p.auth_username || ""; $("fPass").value = "";
+  $("fUser").value = p.auth_username || "";
   $("fForward").value = p.forward_to || "";
   $("fKeepalive").value = p.keepalive_secs || "";
   $("fIdle").value = p.idle_timeout_secs || "";
   $("fConnTimeout").value = p.connect_timeout_secs || "";
+  (p.override_headers || []).forEach(h => addHeaderRow(h.key, h.value));
+  $("fClientP12Alias").value = p.client_p12_alias || "";
+  $("fMtls").checked = !!p.mtls_required;
+  if (p.has_client_p12)
+    $("clientP12Status").textContent = "A client certificate is stored — upload a file to replace it.";
+  if (p.has_server_p12)
+    $("serverP12Status").textContent = "A listener keystore is stored — upload a file to replace it.";
+  if (p.has_truststore)
+    $("truststoreStatus").textContent = "A truststore is stored — upload a file to replace it.";
   onProtoChange();
+  onMtlsChange();
   $("formErr").textContent = (p.auth_enabled || p.protocol === "shadowsocks")
     ? "Re-enter the password to keep credentials." : "";
   $("formModal").classList.add("show");
 }
 function closeForm() { $("formModal").classList.remove("show"); }
+
 async function saveForm() {
   const proto = $("fProto").value;
   const body = {
@@ -390,6 +588,12 @@ async function saveForm() {
     keepalive_secs: parseInt($("fKeepalive").value) || 0,
     idle_timeout_secs: parseInt($("fIdle").value) || 0,
     connect_timeout_secs: parseInt($("fConnTimeout").value) || 0,
+    client_p12: null, client_p12_password: null,
+    client_p12_alias: null, client_p12_entry_password: null,
+    override_headers: [],
+    server_p12: null, server_p12_password: null,
+    server_truststore_p12: null, server_truststore_password: null,
+    mtls_required: false,
   };
   if (proto === "shadowsocks") {
     body.ss_method = $("fCipher").value;
@@ -399,12 +603,27 @@ async function saveForm() {
   } else {
     const user = $("fUser").value.trim();
     if (user) body.auth = { username: user, password: $("fPass").value };
+    if (proto === "websocket") body.forward_to = $("fForward").value.trim();
+  }
+  if (proto === "http" || proto === "https") {
+    body.override_headers = collectHeaders();
+    body.client_p12 = await p12Value("fClientP12", clientP12Cleared);
+    body.client_p12_password = $("fClientP12Pass").value || null;
+    body.client_p12_alias = $("fClientP12Alias").value.trim() || null;
+    body.client_p12_entry_password = $("fClientP12EntryPass").value || null;
+  }
+  if (proto === "https") {
+    body.server_p12 = await p12Value("fServerP12", serverP12Cleared);
+    body.server_p12_password = $("fServerP12Pass").value || null;
+    body.mtls_required = $("fMtls").checked;
+    body.server_truststore_p12 = await p12Value("fTruststore", truststoreCleared);
+    body.server_truststore_password = $("fTruststorePass").value || null;
   }
   if (!body.name || !body.listen_addr) {
     $("formErr").textContent = "Name and listen address are required."; return;
   }
-  if (proto === "tcp" && !body.forward_to) {
-    $("formErr").textContent = "TCP forwarder needs a destination."; return;
+  if ((proto === "tcp" || proto === "websocket") && !body.forward_to) {
+    $("formErr").textContent = "This proxy needs a forward destination."; return;
   }
   const url = editId ? `/api/proxies/${editId}` : "/api/proxies";
   const r = await fetch(url, {
@@ -413,7 +632,7 @@ async function saveForm() {
     body: JSON.stringify(body),
   });
   if (r.ok) { closeForm(); refresh(); }
-  else $("formErr").textContent = (await r.json()).error || "request failed";
+  else $("formErr").textContent = (await r.json().catch(() => ({}))).error || "request failed";
 }
 
 // ---- history (paginated) ----
@@ -464,8 +683,61 @@ async function clearHist() {
 }
 function closeHist() { $("histModal").classList.remove("show"); }
 
+// ---- blocklist (global or per-proxy) ----
+let blockScope = { proxyId: null, name: "" };
+function blUrl() {
+  return blockScope.proxyId
+    ? `/api/proxies/${blockScope.proxyId}/blocklist`
+    : "/api/blocklist";
+}
+function openBlock() {
+  blockScope = { proxyId: null, name: "" };
+  $("blTitle").textContent = "Blocked source addresses · global";
+  $("blScopeHint").textContent =
+    "Global blocklist — addresses are refused on every proxy at accept time; matching live connections are dropped immediately.";
+  $("blErr").textContent = ""; $("blAddr").value = "";
+  $("blockModal").classList.add("show");
+  loadBlocklist();
+}
+function openProxyBlock(id, name) {
+  blockScope = { proxyId: id, name };
+  $("blTitle").textContent = `Blocklist · ${name}`;
+  $("blScopeHint").textContent =
+    "Per-proxy blocklist — addresses are refused on this proxy only; the global blocklist still applies on top.";
+  $("blErr").textContent = ""; $("blAddr").value = "";
+  $("blockModal").classList.add("show");
+  loadBlocklist();
+}
+function closeBlock() { $("blockModal").classList.remove("show"); }
+async function loadBlocklist() {
+  let list = [];
+  try { list = await fetch(blUrl()).then(r => r.json()); } catch (e) {}
+  $("blList").innerHTML = list.length
+    ? list.map(a => `<div class="bl-row"><span class="spacer">${esc(a)}</span>
+        <button class="tiny" onclick="removeBlock('${esc(a)}')">Unblock</button></div>`).join("")
+    : `<div class="hint" style="padding:8px 0;">No addresses are blocked.</div>`;
+}
+async function addBlock() {
+  const addr = $("blAddr").value.trim();
+  if (!addr) { $("blErr").textContent = "Enter an IP or IP:port."; return; }
+  const r = await fetch(blUrl(), {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ addr }),
+  });
+  if (r.ok) { $("blAddr").value = ""; $("blErr").textContent = ""; loadBlocklist(); refresh(); }
+  else $("blErr").textContent = (await r.json().catch(() => ({}))).error || "block failed";
+}
+async function removeBlock(addr) {
+  await fetch(blUrl(), {
+    method: "DELETE", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ addr }),
+  });
+  loadBlocklist();
+  refresh();
+}
+
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") { closeForm(); closeHist(); }
+  if (e.key === "Escape") { closeForm(); closeHist(); closeBlock(); }
 });
 
 // ---- login / session ----
