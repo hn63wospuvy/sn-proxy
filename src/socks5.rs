@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 const VER: u8 = 0x05;
 const CMD_CONNECT: u8 = 0x01;
+#[allow(dead_code)]
+const CMD_BIND: u8 = 0x02;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_USERPASS: u8 = 0x02;
 const METHOD_REJECT: u8 = 0xFF;
@@ -28,37 +31,51 @@ pub async fn serve(
     token: CancellationToken,
 ) -> Result<()> {
     negotiate_auth(&mut stream, &runtime).await?;
-    let dst = read_request(&mut stream).await?;
-
-    let (connect_timeout, keepalive, idle) = {
-        let cfg = runtime.config.lock().unwrap();
-        (cfg.connect_timeout_secs, cfg.keepalive_secs, cfg.idle_timeout_secs)
-    };
-    let target = match relay::connect(&dst, connect_timeout, keepalive).await {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = reply(&mut stream, 0x05).await; // connection refused
-            bail!("connect to {dst} failed: {e}");
+    let req = read_request(&mut stream).await?;
+    match req.cmd {
+        CMD_CONNECT => {
+            let dst = req.host_port();
+            let (connect_timeout, keepalive, idle) = {
+                let cfg = runtime.config.lock().unwrap();
+                (cfg.connect_timeout_secs, cfg.keepalive_secs, cfg.idle_timeout_secs)
+            };
+            let target = match relay::connect(&dst, connect_timeout, keepalive).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = reply(&mut stream, 0x05).await; // connection refused
+                    bail!("connect to {dst} failed: {e}");
+                }
+            };
+            // Success: BND.ADDR/BND.PORT reported as 0.0.0.0:0.
+            stream
+                .write_all(&[VER, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            relay::tracked(&manager.storage, &runtime, peer.to_string(), dst, |entry| async move {
+                let idle_fut = relay::idle_watchdog(
+                    entry.clone(),
+                    idle.filter(|s| *s > 0).map(Duration::from_secs),
+                );
+                let mut client = relay::Counting::new(stream, entry);
+                let mut target = target;
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut client, &mut target) => {}
+                    _ = token.cancelled() => {}
+                    _ = idle_fut => {}
+                }
+            })
+            .await;
+            Ok(())
         }
-    };
-    // Success: BND.ADDR/BND.PORT reported as 0.0.0.0:0.
-    stream
-        .write_all(&[VER, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-
-    relay::tracked(&manager.storage, &runtime, peer.to_string(), dst, |entry| async move {
-        let idle_fut =
-            relay::idle_watchdog(entry.clone(), idle.filter(|s| *s > 0).map(Duration::from_secs));
-        let mut client = relay::Counting::new(stream, entry);
-        let mut target = target;
-        tokio::select! {
-            _ = tokio::io::copy_bidirectional(&mut client, &mut target) => {}
-            _ = token.cancelled() => {}
-            _ = idle_fut => {}
+        CMD_UDP_ASSOCIATE => {
+            // Implemented in Task 6.
+            let _ = reply(&mut stream, 0x07).await; // temporary: until Task 6
+            bail!("udp associate not yet wired");
         }
-    })
-    .await;
-    Ok(())
+        _ => {
+            let _ = reply(&mut stream, 0x07).await; // command not supported (incl. BIND 0x02)
+            bail!("command not supported");
+        }
+    }
 }
 
 /// Perform the SOCKS5 method-selection handshake and, if the proxy requires
@@ -115,8 +132,27 @@ async fn negotiate_auth(stream: &mut TcpStream, runtime: &ProxyRuntime) -> Resul
     }
 }
 
-/// Read the SOCKS5 request and return the destination as `host:port`.
-async fn read_request(stream: &mut TcpStream) -> Result<String> {
+/// A parsed SOCKS5 request line (after method negotiation).
+pub(crate) struct Socks5Request {
+    pub cmd: u8,
+    /// Address type of the request (unused until the UDP path consumes it).
+    #[allow(dead_code)]
+    pub atyp: u8,
+    /// Host: a literal IPv4 (`1.2.3.4`), a bracketed IPv6 (`[::1]`), or a domain.
+    pub host: String,
+    pub port: u16,
+}
+
+impl Socks5Request {
+    /// The destination as `host:port` (v6 host already carries brackets).
+    pub fn host_port(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+/// Read the SOCKS5 request line. Does NOT dispatch on `cmd` — `serve` decides.
+/// Still replies `0x08` (address type not supported) for an unknown ATYP.
+async fn read_request(stream: &mut TcpStream) -> Result<Socks5Request> {
     let mut req = [0u8; 4]; // VER | CMD | RSV | ATYP
     stream.read_exact(&mut req).await?;
     if req[0] != VER {
@@ -152,11 +188,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<String> {
     stream.read_exact(&mut port).await?;
     let port = u16::from_be_bytes(port);
 
-    if cmd != CMD_CONNECT {
-        let _ = reply(stream, 0x07).await; // command not supported
-        bail!("only the CONNECT command is supported");
-    }
-    Ok(format!("{host}:{port}"))
+    Ok(Socks5Request { cmd, atyp, host, port })
 }
 
 /// Send a SOCKS5 reply carrying only a status code.
@@ -165,4 +197,24 @@ async fn reply(stream: &mut TcpStream, code: u8) -> Result<()> {
         .write_all(&[VER, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_port_formats_v4_and_domain() {
+        let r = Socks5Request { cmd: CMD_CONNECT, atyp: 0x01, host: "1.2.3.4".into(), port: 80 };
+        assert_eq!(r.host_port(), "1.2.3.4:80");
+        let d = Socks5Request { cmd: CMD_UDP_ASSOCIATE, atyp: 0x03, host: "example.com".into(), port: 443 };
+        assert_eq!(d.host_port(), "example.com:443");
+    }
+
+    #[test]
+    fn host_port_brackets_v6() {
+        let r = Socks5Request { cmd: CMD_CONNECT, atyp: 0x04, host: "[::1]".into(), port: 9 };
+        // host already carries brackets for v6 (matches read_request output).
+        assert_eq!(r.host_port(), "[::1]:9");
+    }
 }
