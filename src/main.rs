@@ -17,6 +17,7 @@ mod storage;
 mod tcp;
 mod tls;
 mod udp;
+mod udp_socks;
 mod ws;
 mod ws_proxy;
 
