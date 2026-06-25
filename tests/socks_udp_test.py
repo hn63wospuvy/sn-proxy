@@ -134,6 +134,155 @@ def test_domain_literal_reply(sport):
     ctrl.close(); echo.close(); cli.close()
     print("OK test_domain_literal_reply")
 
+def api(admin, method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"http://{HOST}:{admin}{path}", data=data,
+                                 method=method,
+                                 headers={"Content-Type": "application/json"} if data else {})
+    return urllib.request.urlopen(req)
+
+def snapshot(admin):
+    return json.loads(api(admin, "GET", "/api/proxies").read())
+
+def test_lifetime_teardown(admin, pid, sport):
+    echo, eport = udp_echo_server()
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cli.sendto(frame(0x01, socket.inet_aton(HOST), eport, b"a"), (bnd_ip, bnd_port))
+    echo.settimeout(2); echo.recvfrom(2048)
+    ctrl.close(); time.sleep(0.4)  # control conn closed → association ends
+    cli.sendto(frame(0x01, socket.inet_aton(HOST), eport, b"b"), (bnd_ip, bnd_port))
+    echo.settimeout(0.8)
+    try:
+        echo.recvfrom(2048); raise AssertionError("relay must stop after TCP close")
+    except socket.timeout:
+        pass
+    echo.close(); cli.close()
+    print("OK test_lifetime_teardown")
+
+def test_blocklist_per_proxy(admin, pid, sport):
+    # Two echo servers; block ONE destination via the per-proxy list, the other
+    # stays open. On an all-loopback host the control connection and the
+    # destination share the IP 127.0.0.1, so we block the DESTINATION's full
+    # IP:port (127.0.0.1:<bport>). That neither refuses the control connection
+    # (different source port) nor tears down the live association, but does drop
+    # the datagram to the blocked dest. The open echo server still receives.
+    blocked, bport = udp_echo_server()
+    openes, oport = udp_echo_server()
+    api(admin, "POST", f"/api/proxies/{pid}/blocklist", {"addr": f"127.0.0.1:{bport}"})
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cli.sendto(frame(0x01, socket.inet_aton(HOST), bport, b"x"), (bnd_ip, bnd_port))
+    blocked.settimeout(0.8)
+    try:
+        blocked.recvfrom(2048); raise AssertionError("per-proxy blocked dest must drop")
+    except socket.timeout:
+        pass
+    # Control plane intact: the non-blocked dest still receives.
+    cli.sendto(frame(0x01, socket.inet_aton(HOST), oport, b"y"), (bnd_ip, bnd_port))
+    openes.settimeout(2)
+    data, _ = openes.recvfrom(2048)
+    assert data == b"y", data
+    api(admin, "DELETE", f"/api/proxies/{pid}/blocklist", {"addr": f"127.0.0.1:{bport}"})
+    ctrl.close(); blocked.close(); openes.close(); cli.close()
+    print("OK test_blocklist_per_proxy")
+
+def test_ssrf_mapped(admin, pid, sport):
+    # udp_allow_private MUST be false for this proxy.
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # ::ffff:127.0.0.1 mapped → must be dropped; we just assert no crash + no reply.
+    mapped = socket.inet_pton(socket.AF_INET6, "::ffff:7f00:1")
+    cli.sendto(frame(0x04, mapped, 9, b"x"), (bnd_ip, bnd_port))
+    cli.settimeout(0.8)
+    try:
+        cli.recvfrom(2048); raise AssertionError("mapped-internal dest must drop")
+    except socket.timeout:
+        pass
+    ctrl.close(); cli.close()
+    print("OK test_ssrf_mapped")
+
+def test_accounting(admin, pid, sport):
+    echo, eport = udp_echo_server()
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cli.sendto(frame(0x01, socket.inet_aton(HOST), eport, b"12345"), (bnd_ip, bnd_port))
+    echo.settimeout(2); data, src = echo.recvfrom(2048); echo.sendto(b"678", src)
+    cli.settimeout(2); cli.recvfrom(2048); time.sleep(0.4)
+    snap = [p for p in snapshot(admin) if p["id"] == pid][0]
+    conns = snap["active_connections"]
+    assert conns and conns[0]["bytes_sent"] == 5 and conns[0]["bytes_received"] == 3, conns
+    ctrl.close(); echo.close(); cli.close()
+    print("OK test_accounting")
+
+def test_admin_terminate_ip(admin, pid, sport):
+    ctrl = socket.create_connection((HOST, sport))
+    socks_associate(ctrl)
+    time.sleep(0.3)
+    snap = [p for p in snapshot(admin) if p["id"] == pid][0]
+    assert snap["active_connections"], "association must be live"
+    api(admin, "POST", "/api/blocklist", {"addr": "127.0.0.1"})  # block bare IP
+    time.sleep(0.4)
+    snap = [p for p in snapshot(admin) if p["id"] == pid][0]
+    assert not snap["active_connections"], "blocking peer IP must tear down"
+    api(admin, "DELETE", "/api/blocklist", {"addr": "127.0.0.1"})
+    ctrl.close()
+    print("OK test_admin_terminate_ip")
+
+def test_proxy_stop_teardown(admin, pid, sport):
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    api(admin, "POST", f"/api/proxies/{pid}/stop")
+    time.sleep(0.4)
+    snap = [p for p in snapshot(admin) if p["id"] == pid][0]
+    assert not snap["running"] and not snap["active_connections"]
+    api(admin, "POST", f"/api/proxies/{pid}/start"); time.sleep(0.3)
+    ctrl.close()
+    print("OK test_proxy_stop_teardown")
+
+def test_feature_gate(admin):
+    # Separate proxy with udp_associate_enabled=false.
+    cfg = json.loads(api(admin, "POST", "/api/proxies", {
+        "name": "noudp", "protocol": "socks5", "listen_addr": f"{HOST}:11081",
+        "udp_associate_enabled": False,
+    }).read())
+    api(admin, "POST", f"/api/proxies/{cfg['id']}/start"); time.sleep(0.3)
+    ctrl = socket.create_connection((HOST, 11081))
+    ctrl.sendall(b"\x05\x01\x00"); assert ctrl.recv(2) == b"\x05\x00"
+    ctrl.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+    rep = ctrl.recv(4)
+    assert rep[1] == 0x07, f"disabled UDP must reply 0x07, got {rep!r}"
+    ctrl.close()
+    print("OK test_feature_gate")
+
+def test_ipv6_roundtrip(admin):
+    try:
+        t = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); t.bind(("::1", 0)); t.close()
+    except OSError:
+        print("SKIP test_ipv6_roundtrip (no ::1)"); return
+    cfg = json.loads(api(admin, "POST", "/api/proxies", {
+        "name": "v6", "protocol": "socks5", "listen_addr": "[::1]:11082",
+        "udp_associate_enabled": True, "udp_allow_private": True,
+    }).read())
+    api(admin, "POST", f"/api/proxies/{cfg['id']}/start"); time.sleep(0.3)
+    echo = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); echo.bind(("::1", 0))
+    eport = echo.getsockname()[1]
+    ctrl = socket.create_connection(("::1", 11082))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    addr6 = socket.inet_pton(socket.AF_INET6, "::1")
+    cli.sendto(frame(0x04, addr6, eport, b"v6ping"), (bnd_ip, bnd_port))
+    echo.settimeout(2); data, src = echo.recvfrom(2048); echo.sendto(b"v6pong", src)
+    cli.settimeout(2); rep, _ = cli.recvfrom(2048)
+    h = parse_reply(rep)
+    assert h["atyp"] == 0x04 and h["data"] == b"v6pong", h
+    ctrl.close(); echo.close(); cli.close()
+    print("OK test_ipv6_roundtrip")
+
 def boot_and_create(udp_enabled=True, allow_private=False):
     data = tempfile.mkdtemp(prefix="snudp-")
     admin_port = 18080
@@ -180,15 +329,49 @@ def shutdown(proc):
         proc.kill()
         proc.wait(timeout=5)
 
+def create_proxy(admin, name, listen_addr, allow_private=False, enabled=True, start=True):
+    cfg = json.loads(api(admin, "POST", "/api/proxies", {
+        "name": name, "protocol": "socks5", "listen_addr": listen_addr,
+        "udp_associate_enabled": enabled, "udp_allow_private": allow_private,
+    }).read())
+    pid = cfg["id"]
+    if start:
+        api(admin, "POST", f"/api/proxies/{pid}/start"); time.sleep(0.3)
+    return pid
+
 if __name__ == "__main__":
     # The relay proxy uses loopback echo servers, so allow_private=True is
-    # required for the forward path to reach them.
+    # required for the forward path to reach them. boot_and_create makes the
+    # main relay proxy on 11080 (allow_private=True).
     proc, admin, pid, sport = boot_and_create(allow_private=True)
+    failures = []
+    def run(fn, *args):
+        try:
+            fn(*args)
+        except Exception as e:
+            failures.append((fn.__name__, repr(e)))
+            print(f"FAIL {fn.__name__}: {e!r}")
     try:
-        test_handshake_and_bnd(sport)
-        test_frag_dropped(sport)
-        test_reflection_guard(sport)
-        test_echo_roundtrip(sport)
-        test_domain_literal_reply(sport)
+        # Core relay tests against the allow_private=True proxy.
+        run(test_handshake_and_bnd, sport)
+        run(test_frag_dropped, sport)
+        run(test_reflection_guard, sport)
+        run(test_echo_roundtrip, sport)
+        run(test_domain_literal_reply, sport)
+        run(test_lifetime_teardown, admin, pid, sport)
+        run(test_accounting, admin, pid, sport)
+        run(test_blocklist_per_proxy, admin, pid, sport)
+        run(test_proxy_stop_teardown, admin, pid, sport)
+        run(test_admin_terminate_ip, admin, pid, sport)
+        # SSRF test needs allow_private=FALSE → its own proxy on 11083.
+        ssrf_pid = create_proxy(admin, "ssrf", f"{HOST}:11083", allow_private=False)
+        run(test_ssrf_mapped, admin, ssrf_pid, 11083)
+        # Feature gate + IPv6 create their own proxies internally.
+        run(test_feature_gate, admin)
+        run(test_ipv6_roundtrip, admin)
     finally:
         shutdown(proc)
+    if failures:
+        print(f"\n{len(failures)} FAILURE(S): " + ", ".join(n for n, _ in failures))
+        sys.exit(1)
+    print("\nALL TESTS PASSED")
