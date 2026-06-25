@@ -669,6 +669,35 @@ impl Manager {
         }
     }
 
+    /// Pure matcher: does `ip:port` match either blocklist (manager-wide set
+    /// `mgr` OR per-proxy list `proxy`), by full `ip:port`/`[v6]:port` or bare
+    /// `ip`? V6 uses the bracketed form to match `src_ip`'s parser.
+    pub(crate) fn dest_blocked_in(
+        mgr: &std::collections::HashSet<String>,
+        proxy: &[String],
+        ip: IpAddr,
+        port: u16,
+    ) -> bool {
+        let bare = ip.to_string();
+        let full = match ip {
+            IpAddr::V4(_) => format!("{ip}:{port}"),
+            IpAddr::V6(_) => format!("[{ip}]:{port}"),
+        };
+        let hit = |s: &str| s == bare || s == full;
+        mgr.contains(&bare) || mgr.contains(&full) || proxy.iter().any(|a| hit(a))
+    }
+
+    /// Whether a UDP destination `ip:port` is blocked, ORing the manager-wide
+    /// blocklist with this proxy's per-proxy blocklist (C2). Reuses the same
+    /// source-blocklist namespace intentionally (a blocked address is blocked
+    /// both as a source and as a UDP destination).
+    #[allow(dead_code)] // consumed by the SOCKS5 UDP relay (Task 7).
+    pub(crate) fn dest_blocked(&self, runtime: &ProxyRuntime, ip: IpAddr, port: u16) -> bool {
+        let mgr = self.blocklist.lock().unwrap();
+        let proxy = runtime.config.lock().unwrap().blocklist.clone();
+        Self::dest_blocked_in(&mgr, &proxy, ip, port)
+    }
+
     async fn accept_loop(
         manager: Arc<Self>,
         runtime: Arc<ProxyRuntime>,
@@ -1005,5 +1034,46 @@ mod udp_internal_tests {
     fn nat64_wrapper_of_internal_blocked() {
         // 64:ff9b::7f00:1 wraps 127.0.0.1
         assert!(Manager::is_internal_dest("64:ff9b::7f00:1".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod dest_blocked_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn matches_v4_full_and_bare() {
+        let mut mgr: HashSet<String> = HashSet::new();
+        mgr.insert("1.2.3.4:53".into());
+        let proxy: Vec<String> = vec![];
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert!(Manager::dest_blocked_in(&mgr, &proxy, ip, 53)); // full
+        assert!(!Manager::dest_blocked_in(&mgr, &proxy, ip, 54)); // wrong port
+        let mut bare: HashSet<String> = HashSet::new();
+        bare.insert("1.2.3.4".into());
+        assert!(Manager::dest_blocked_in(&bare, &proxy, ip, 99)); // bare ip
+    }
+
+    #[test]
+    fn matches_per_proxy_half() {
+        let mgr: HashSet<String> = HashSet::new();
+        let proxy: Vec<String> = vec!["9.9.9.9".into()];
+        let ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+        // Blocked ONLY via the per-proxy list — proves the OR covers it.
+        assert!(Manager::dest_blocked_in(&mgr, &proxy, ip, 853));
+    }
+
+    #[test]
+    fn matches_v6_bracketed_and_bare() {
+        let mut mgr: HashSet<String> = HashSet::new();
+        mgr.insert("[2001:db8::1]:443".into());
+        let proxy: Vec<String> = vec![];
+        let ip = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
+        assert!(Manager::dest_blocked_in(&mgr, &proxy, ip, 443));
+        let mut bare: HashSet<String> = HashSet::new();
+        bare.insert("2001:db8::1".into());
+        assert!(Manager::dest_blocked_in(&bare, &proxy, ip, 1));
     }
 }
