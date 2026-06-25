@@ -14,3 +14,6 @@ mtls_test/*.p12
 *.pem
 .claude
 docs
+# Python bytecode cache
+__pycache__/
+*.pyc
