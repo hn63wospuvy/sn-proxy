@@ -3,12 +3,16 @@
 //! Only the `CONNECT` command is supported, which is what proxy clients
 //! (browsers, curl, etc.) use.
 
-use crate::manager::{Manager, ProxyRuntime};
+use crate::manager::{ConnEntry, Manager, ProxyRuntime};
 use crate::relay;
+use crate::udp_socks::{ParsedHost, parse_udp_request};
 use anyhow::{Result, bail};
+use dashmap::DashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +25,28 @@ const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_USERPASS: u8 = 0x02;
 const METHOD_REJECT: u8 = 0xFF;
+
+/// One per-destination outbound socket plus its idle bookkeeping.
+struct DestEntry {
+    sock: Arc<UdpSocket>,
+    last_active: StdMutex<Instant>,
+}
+
+/// Resolve a `ParsedHost` to a canonical `SocketAddr`, doing NO blocking I/O.
+/// Returns `None` for a domain (caller handles the cache/off-loop path).
+fn resolve_literal(host: &ParsedHost, port: u16) -> Option<SocketAddr> {
+    match host {
+        ParsedHost::V4(a) => Some(SocketAddr::new(
+            Manager::canonicalize_ip(IpAddr::V4(Ipv4Addr::from(*a))),
+            port,
+        )),
+        ParsedHost::V6(a) => Some(SocketAddr::new(
+            Manager::canonicalize_ip(IpAddr::V6(Ipv6Addr::from(*a))),
+            port,
+        )),
+        ParsedHost::Domain(_) => None,
+    }
+}
 
 /// Handle a single accepted SOCKS5 client connection end to end.
 pub async fn serve(
@@ -320,17 +346,168 @@ async fn udp_associate(
     Ok(())
 }
 
-/// Placeholder relay loop — replaced by the per-datagram router in Task 7.
+/// Per-datagram router for one UDP association. Owns the per-destination
+/// outbound-socket map and the DNS cache, pins the client on the first accepted
+/// datagram, canonicalizes the destination once, filters it, and forwards via
+/// an atomic-claimed per-dest socket.
 async fn udp_relay_loop(
-    _manager: Arc<Manager>,
-    _runtime: Arc<ProxyRuntime>,
-    _relay_sock: Arc<UdpSocket>,
-    _peer: SocketAddr,
-    _entry: Arc<crate::manager::ConnEntry>,
-    _max_datagram: usize,
-    _allow_private: bool,
+    manager: Arc<Manager>,
+    runtime: Arc<ProxyRuntime>,
+    relay_sock: Arc<UdpSocket>,
+    peer: SocketAddr,
+    entry: Arc<ConnEntry>,
+    max_datagram: usize,
+    allow_private: bool,
 ) {
-    std::future::pending::<()>().await;
+    // recv buffer holds DATA + worst-case domain header (7 + 255 = 262).
+    let mut buf = vec![0u8; max_datagram + 262];
+    let dests: Arc<DashMap<SocketAddr, Arc<DestEntry>>> = Arc::new(DashMap::new());
+    // name -> (canonical SocketAddr, inserted_at) ; TTL-bounded cache.
+    let dns_cache: Arc<DashMap<String, (SocketAddr, Instant)>> = Arc::new(DashMap::new());
+    const DNS_TTL: Duration = Duration::from_secs(30);
+    let mut pinned: Option<SocketAddr> = None;
+
+    loop {
+        let (n, from) = match relay_sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(_) => return, // unrecoverable relay-socket error
+        };
+        // Pin: first datagram must come from the control peer IP; thereafter
+        // accept only the exact pinned 2-tuple. All else dropped silently.
+        match pinned {
+            None => {
+                if from.ip() != peer.ip() {
+                    continue;
+                }
+                pinned = Some(from);
+            }
+            Some(p) => {
+                if from != p {
+                    continue;
+                }
+            }
+        }
+        let pkt = &buf[..n];
+        let Some(hdr) = parse_udp_request(pkt) else {
+            continue; // RSV/FRAG/length invalid → silent drop
+        };
+        let data = pkt[hdr.data_offset..].to_vec();
+
+        match &hdr.host {
+            ParsedHost::V4(_) | ParsedHost::V6(_) => {
+                let Some(canon) = resolve_literal(&hdr.host, hdr.port) else {
+                    continue;
+                };
+                forward_one(
+                    &manager, &runtime, &relay_sock, &entry, &dests,
+                    pinned.unwrap(), canon, data, allow_private,
+                )
+                .await;
+            }
+            ParsedHost::Domain(name) => {
+                let now = Instant::now();
+                // Read the cache into a plain value, dropping the DashMap guard
+                // before any await (never hold a Ref across `.await`).
+                let cached = dns_cache
+                    .get(name)
+                    .filter(|c| now.duration_since(c.1) < DNS_TTL)
+                    .map(|c| c.0);
+                if let Some(canon) = cached {
+                    forward_one(
+                        &manager, &runtime, &relay_sock, &entry, &dests,
+                        pinned.unwrap(), canon, data, allow_private,
+                    )
+                    .await;
+                    continue;
+                }
+                // Cache miss / TTL expiry: resolve OFF the recv loop (B3).
+                let (m, rt, rs, en, ds, dc) = (
+                    manager.clone(), runtime.clone(), relay_sock.clone(),
+                    entry.clone(), dests.clone(), dns_cache.clone(),
+                );
+                let (name, port, client) = (name.clone(), hdr.port, pinned.unwrap());
+                tokio::spawn(async move {
+                    let lookup = format!("{name}:{port}");
+                    let resolved = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tokio::net::lookup_host(lookup),
+                    )
+                    .await;
+                    let Ok(Ok(mut addrs)) = resolved else { return };
+                    let Some(addr) = addrs.next() else { return };
+                    let canon = SocketAddr::new(Manager::canonicalize_ip(addr.ip()), port);
+                    dc.insert(name, (canon, Instant::now()));
+                    forward_one(&m, &rt, &rs, &en, &ds, client, canon, data, allow_private).await;
+                });
+            }
+        }
+    }
+}
+
+/// Filter, atomically claim a per-destination socket, and forward `DATA`.
+#[allow(clippy::too_many_arguments)]
+async fn forward_one(
+    manager: &Arc<Manager>,
+    runtime: &Arc<ProxyRuntime>,
+    relay_sock: &Arc<UdpSocket>,
+    entry: &Arc<ConnEntry>,
+    dests: &Arc<DashMap<SocketAddr, Arc<DestEntry>>>,
+    client: SocketAddr,
+    canon: SocketAddr,
+    data: Vec<u8>,
+    allow_private: bool,
+) {
+    // Destination security filter on the CANONICAL address (B2/C1).
+    if manager.dest_blocked(runtime, canon.ip(), canon.port()) {
+        return;
+    }
+    if !allow_private && Manager::is_internal_dest(canon.ip()) {
+        return;
+    }
+    // Atomic claim keyed by canonical dest: concurrent misses coalesce.
+    // On bind/connect failure, silently drop (no panic).
+    let dest = match dests.entry(canon) {
+        dashmap::mapref::entry::Entry::Occupied(o) => o.get().clone(),
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            let bind: SocketAddr = if canon.is_ipv4() {
+                (Ipv4Addr::UNSPECIFIED, 0).into()
+            } else {
+                (Ipv6Addr::UNSPECIFIED, 0).into()
+            };
+            let built = std::net::UdpSocket::bind(bind).and_then(|s| {
+                s.set_nonblocking(true)?;
+                s.connect(canon)?;
+                Ok(s)
+            });
+            let Ok(std_sock) = built else { return };
+            let Ok(sock) = UdpSocket::from_std(std_sock) else { return };
+            let sock = Arc::new(sock);
+            let de = Arc::new(DestEntry {
+                sock: sock.clone(),
+                last_active: StdMutex::new(Instant::now()),
+            });
+            spawn_reply_task(relay_sock.clone(), sock, entry.clone(), client, dests.clone(), canon);
+            v.insert(de.clone());
+            de
+        }
+    };
+    *dest.last_active.lock().unwrap() = Instant::now();
+    if dest.sock.send(&data).await.is_ok() {
+        entry.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Reply task: relay `dest`'s answers back to the pinned client. Implemented
+/// in Task 8.
+fn spawn_reply_task(
+    _relay_sock: Arc<UdpSocket>,
+    _dest_sock: Arc<UdpSocket>,
+    _entry: Arc<ConnEntry>,
+    _client: SocketAddr,
+    _dests: Arc<DashMap<SocketAddr, Arc<DestEntry>>>,
+    _canon: SocketAddr,
+) {
+    // Task 8.
 }
 
 #[cfg(test)]

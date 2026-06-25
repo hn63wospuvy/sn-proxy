@@ -29,6 +29,78 @@ def test_handshake_and_bnd(port):
     ctrl.close()
     print("OK test_handshake_and_bnd")
 
+def udp_echo_server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((HOST, 0))
+    return s, s.getsockname()[1]
+
+def frame(atyp, addrbytes, port, data):
+    return b"\x00\x00\x00" + bytes([atyp]) + addrbytes + struct.pack("!H", port) + data
+
+def parse_reply(rep):
+    assert rep[0:3] == b"\x00\x00\x00"
+    atyp = rep[3]
+    if atyp == 0x01:
+        ip = socket.inet_ntoa(rep[4:8]); off = 8
+    elif atyp == 0x04:
+        ip = socket.inet_ntop(socket.AF_INET6, rep[4:20]); off = 20
+    else:
+        raise AssertionError("reply must be literal")
+    port = struct.unpack("!H", rep[off:off+2])[0]
+    return {"atyp": atyp, "ip": ip, "port": port, "data": rep[off+2:]}
+
+def test_echo_roundtrip(sport):
+    echo, eport = udp_echo_server()
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    pkt = frame(0x01, socket.inet_aton(HOST), eport, b"ping")
+    cli.sendto(pkt, (bnd_ip, bnd_port))
+    echo.settimeout(2); data, src = echo.recvfrom(2048)
+    assert data == b"ping", data
+    echo.sendto(b"pong", src)
+    cli.settimeout(2); rep, _ = cli.recvfrom(2048)
+    h = parse_reply(rep)
+    assert h["data"] == b"pong" and h["atyp"] == 0x01
+    ctrl.close(); echo.close(); cli.close()
+    print("OK test_echo_roundtrip")
+
+def test_frag_dropped(sport):
+    echo, eport = udp_echo_server()
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    pkt = b"\x00\x00\x01\x01" + socket.inet_aton(HOST) + struct.pack("!H", eport) + b"x"
+    cli.sendto(pkt, (bnd_ip, bnd_port))
+    echo.settimeout(0.8)
+    try:
+        echo.recvfrom(2048); raise AssertionError("FRAG!=0 must be dropped")
+    except socket.timeout:
+        pass
+    ctrl.close(); echo.close(); cli.close()
+    print("OK test_frag_dropped")
+
+def test_reflection_guard(sport):
+    echo, eport = udp_echo_server()
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    # send from a fresh socket that has NOT been pinned via the first datagram —
+    # source IP equals control peer IP (127.0.0.1) here, so to truly test the
+    # cross-source drop we rely on the pin: send a first datagram to pin, then
+    # from a DIFFERENT port (a different 2-tuple) — must be dropped.
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cli.sendto(frame(0x01, socket.inet_aton(HOST), eport, b"a"), (bnd_ip, bnd_port))
+    echo.settimeout(2); echo.recvfrom(2048)  # pin established
+    other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    other.sendto(frame(0x01, socket.inet_aton(HOST), eport, b"b"), (bnd_ip, bnd_port))
+    echo.settimeout(0.8)
+    try:
+        echo.recvfrom(2048); raise AssertionError("unpinned source must be dropped")
+    except socket.timeout:
+        pass
+    ctrl.close(); echo.close(); cli.close(); other.close()
+    print("OK test_reflection_guard")
+
 def boot_and_create(udp_enabled=True, allow_private=False):
     data = tempfile.mkdtemp(prefix="snudp-")
     admin_port = 18080
@@ -76,8 +148,13 @@ def shutdown(proc):
         proc.wait(timeout=5)
 
 if __name__ == "__main__":
-    proc, admin, pid, sport = boot_and_create()
+    # The relay proxy uses loopback echo servers, so allow_private=True is
+    # required for the forward path to reach them.
+    proc, admin, pid, sport = boot_and_create(allow_private=True)
     try:
         test_handshake_and_bnd(sport)
+        test_frag_dropped(sport)
+        test_reflection_guard(sport)
+        test_echo_roundtrip(sport)
     finally:
         shutdown(proc)
