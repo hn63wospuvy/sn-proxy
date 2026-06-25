@@ -12,3 +12,5 @@ mtls_test/*.p12
 # local config may hold admin_password — keep only the example committed
 /config.properties
 *.pem
+.claude
+docs
