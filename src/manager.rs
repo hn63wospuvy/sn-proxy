@@ -102,7 +102,7 @@ impl ProxySpec {
         if self.listen_addr.trim().is_empty() {
             bail!("listen address is required");
         }
-        if matches!(self.protocol, Protocol::Tcp | Protocol::Websocket)
+        if matches!(self.protocol, Protocol::Tcp | Protocol::Websocket | Protocol::Udp)
             && self.forward_to.as_deref().unwrap_or("").is_empty()
         {
             bail!("this proxy needs a forward destination (host:port)");
@@ -600,6 +600,11 @@ impl Manager {
                                         Err(e) => Err(anyhow!("TLS handshake failed: {e}")),
                                     }
                                 }
+                                Protocol::Udp => {
+                                    // UDP is never dispatched through the TCP accept
+                                    // loop; it has its own listen path (see Task 5).
+                                    Err(anyhow!("udp is not a stream protocol"))
+                                }
                             };
                             if let Err(e) = result {
                                 tracing::debug!("connection from {peer} ended: {e}");
@@ -672,5 +677,48 @@ impl Manager {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Protocol;
+
+    fn udp_spec(forward_to: Option<&str>) -> ProxySpec {
+        ProxySpec {
+            name: "u".into(),
+            protocol: Protocol::Udp,
+            listen_addr: "0.0.0.0:0".into(),
+            auth: None,
+            ss_method: None,
+            ss_password: None,
+            forward_to: forward_to.map(|s| s.to_string()),
+            keepalive_secs: None,
+            idle_timeout_secs: None,
+            connect_timeout_secs: None,
+            client_p12: None,
+            client_p12_password: None,
+            client_p12_alias: None,
+            client_p12_entry_password: None,
+            override_headers: Vec::new(),
+            server_p12: None,
+            server_p12_password: None,
+            server_truststore_p12: None,
+            server_truststore_password: None,
+            mtls_required: false,
+        }
+    }
+
+    #[test]
+    fn udp_as_str_is_udp() {
+        assert_eq!(Protocol::Udp.as_str(), "udp");
+    }
+
+    #[test]
+    fn udp_validate_requires_forward_to() {
+        assert!(udp_spec(None).validate().is_err());
+        assert!(udp_spec(Some("")).validate().is_err());
+        assert!(udp_spec(Some("1.2.3.4:53")).validate().is_ok());
     }
 }

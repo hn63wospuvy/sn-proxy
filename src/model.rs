@@ -19,6 +19,8 @@ pub enum Protocol {
     Tcp,
     /// WebSocket tunnelling proxy to a fixed destination.
     Websocket,
+    /// Plain UDP forwarder to a fixed destination.
+    Udp,
 }
 
 impl Protocol {
@@ -30,6 +32,7 @@ impl Protocol {
             Protocol::Shadowsocks => "shadowsocks",
             Protocol::Tcp => "tcp",
             Protocol::Websocket => "websocket",
+            Protocol::Udp => "udp",
         }
     }
 
