@@ -222,6 +222,34 @@
         </div>
       </div>
 
+      <!-- SOCKS5: UDP ASSOCIATE advanced settings -->
+      <div id="secSocks5" class="section" style="display:none;">
+        <div class="section-title">UDP ASSOCIATE (SOCKS5)</div>
+        <div class="check-line">
+          <input type="checkbox" id="fUdpAssoc" checked onchange="onUdpChange()" />
+          <label for="fUdpAssoc">Enable UDP ASSOCIATE (CMD=0x03)</label>
+        </div>
+        <div class="hint" id="udpAssocHint"></div>
+        <div class="check-line" style="margin-top:8px;">
+          <input type="checkbox" id="fUdpAllowPrivate" onchange="onUdpChange()" />
+          <label for="fUdpAllowPrivate">Allow internal/private destinations (UNSAFE)</label>
+        </div>
+        <div class="hint" id="udpPrivateHint"></div>
+        <div class="row2" style="margin-top:8px;">
+          <div><label>Relay bind address (blank = listener IP)</label>
+            <input id="fUdpBind" placeholder="0.0.0.0" oninput="onUdpChange()" /></div>
+          <div><label>Advertised IP (BND.ADDR; NAT override)</label>
+            <input id="fUdpAdvertise" placeholder="" oninput="onUdpChange()" /></div>
+        </div>
+        <div class="hint" id="udpBindHint"></div>
+        <div class="row2" style="margin-top:8px;">
+          <div><label>Max datagram (bytes, 0 = 64 KiB)</label>
+            <input id="fUdpMaxDg" type="number" min="0" placeholder="0" /></div>
+          <div><label>Max destinations (0 = unlimited)</label>
+            <input id="fUdpMaxDests" type="number" min="0" placeholder="0" /></div>
+        </div>
+      </div>
+
       <!-- advanced settings (all protocols) -->
       <div class="section">
         <div class="section-title">Advanced (0 = off)</div>
@@ -357,6 +385,8 @@ function render(proxies) {
           : (p.auth_enabled ? `<span class="badge auth">AUTH: ${esc(p.auth_username || "")}</span>` : "")}
         ${httpish && p.has_client_p12 ? `<span class="badge auth">CLIENT-CERT</span>` : ""}
         ${p.protocol === "https" && p.mtls_required ? `<span class="badge auth">mTLS</span>` : ""}
+        ${p.protocol === "socks5" && p.udp_associate_enabled ? `<span class="badge auth">UDP</span>` : ""}
+        ${p.protocol === "socks5" && p.udp_allow_private ? `<span class="badge auth" style="background:#a33;">UDP-PRIV</span>` : ""}
         ${httpish && p.override_headers && p.override_headers.length
           ? `<span class="badge auth">${p.override_headers.length} HDR</span>` : ""}
         <div class="spacer"></div>
@@ -461,6 +491,24 @@ function onProtoChange() {
   $("secHttp").style.display = http ? "" : "none";
   $("secServerTls").style.display = (proto === "https") ? "" : "none";
   $("lblPass").textContent = ss ? "Password (required)" : "Password";
+  $("secSocks5").style.display = (proto === "socks5") ? "" : "none";
+  if (proto === "socks5") onUdpChange();
+}
+function onUdpChange() {
+  const assoc = $("fUdpAssoc").checked;
+  const priv = $("fUdpAllowPrivate").checked;
+  const bind = $("fUdpBind").value.trim();
+  const adv = $("fUdpAdvertise").value.trim();
+  $("udpAssocHint").textContent = assoc
+    ? "A UDP relay is security-relevant — exposed only while the proxy runs."
+    : "UDP ASSOCIATE replies 0x07 (command not supported).";
+  $("udpPrivateHint").textContent = priv
+    ? "UNSAFE: allows SSRF to loopback/RFC1918/metadata destinations."
+    : "";
+  const wildcard = bind === "" || bind === "0.0.0.0" || bind === "::";
+  $("udpBindHint").textContent = (wildcard && !adv)
+    ? "Wildcard bind with no advertised IP — BND.ADDR is ambiguous behind NAT; set an advertised IP."
+    : "";
 }
 function onMtlsChange() {
   $("rowTruststore").style.display = $("fMtls").checked ? "" : "none";
@@ -537,6 +585,9 @@ function resetForm() {
   $("fMtls").checked = false;
   $("fTruststore").value = ""; $("fTruststorePass").value = "";
   $("truststoreStatus").textContent = "";
+  $("fUdpAssoc").checked = true; $("fUdpAllowPrivate").checked = false;
+  $("fUdpBind").value = ""; $("fUdpAdvertise").value = "";
+  $("fUdpMaxDg").value = ""; $("fUdpMaxDests").value = "";
   $("formErr").textContent = "";
   onMtlsChange();
 }
@@ -572,6 +623,12 @@ function editProxy(id) {
     $("serverP12Status").textContent = "A listener keystore is stored — upload a file to replace it.";
   if (p.has_truststore)
     $("truststoreStatus").textContent = "A truststore is stored — upload a file to replace it.";
+  $("fUdpAssoc").checked = p.udp_associate_enabled !== false;
+  $("fUdpAllowPrivate").checked = !!p.udp_allow_private;
+  $("fUdpBind").value = p.udp_bind_addr || "";
+  $("fUdpAdvertise").value = p.udp_advertise_ip || "";
+  $("fUdpMaxDg").value = p.udp_max_datagram || "";
+  $("fUdpMaxDests").value = p.udp_max_dests || "";
   onProtoChange();
   onMtlsChange();
   $("formErr").textContent = (p.auth_enabled || p.protocol === "shadowsocks")
@@ -596,6 +653,9 @@ async function saveForm() {
     server_p12: null, server_p12_password: null,
     server_truststore_p12: null, server_truststore_password: null,
     mtls_required: false,
+    udp_associate_enabled: true, udp_allow_private: false,
+    udp_bind_addr: null, udp_advertise_ip: null,
+    udp_max_datagram: 0, udp_max_dests: 0,
   };
   if (proto === "shadowsocks") {
     body.ss_method = $("fCipher").value;
@@ -606,6 +666,14 @@ async function saveForm() {
     const user = $("fUser").value.trim();
     if (user) body.auth = { username: user, password: $("fPass").value };
     if (proto === "websocket") body.forward_to = $("fForward").value.trim();
+  }
+  if (proto === "socks5") {
+    body.udp_associate_enabled = $("fUdpAssoc").checked;
+    body.udp_allow_private = $("fUdpAllowPrivate").checked;
+    body.udp_bind_addr = $("fUdpBind").value.trim() || null;
+    body.udp_advertise_ip = $("fUdpAdvertise").value.trim() || null;
+    body.udp_max_datagram = parseInt($("fUdpMaxDg").value) || 0;
+    body.udp_max_dests = parseInt($("fUdpMaxDests").value) || 0;
   }
   if (proto === "http" || proto === "https") {
     body.override_headers = collectHeaders();
