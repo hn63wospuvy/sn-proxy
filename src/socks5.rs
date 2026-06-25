@@ -6,11 +6,11 @@
 use crate::manager::{Manager, ProxyRuntime};
 use crate::relay;
 use anyhow::{Result, bail};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 const VER: u8 = 0x05;
@@ -66,11 +66,7 @@ pub async fn serve(
             .await;
             Ok(())
         }
-        CMD_UDP_ASSOCIATE => {
-            // Implemented in Task 6.
-            let _ = reply(&mut stream, 0x07).await; // temporary: until Task 6
-            bail!("udp associate not yet wired");
-        }
+        CMD_UDP_ASSOCIATE => udp_associate(manager, runtime, stream, peer, token).await,
         _ => {
             let _ = reply(&mut stream, 0x07).await; // command not supported (incl. BIND 0x02)
             bail!("command not supported");
@@ -197,6 +193,144 @@ async fn reply(stream: &mut TcpStream, code: u8) -> Result<()> {
         .write_all(&[VER, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
     Ok(())
+}
+
+/// Handle a SOCKS5 UDP ASSOCIATE (CMD=0x03). Lazily binds a client-facing
+/// relay UDP socket, replies with BND.ADDR/BND.PORT, and runs the relay inside
+/// `relay::tracked` with a 4-arm `select!` bound to the control connection.
+async fn udp_associate(
+    manager: Arc<Manager>,
+    runtime: Arc<ProxyRuntime>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    token: CancellationToken,
+) -> Result<()> {
+    // 0. Feature gate.
+    let (enabled, bind_cfg, advertise, max_dg, idle, allow_private) = {
+        let cfg = runtime.config.lock().unwrap();
+        (
+            cfg.udp_associate_enabled,
+            cfg.udp_bind_addr.clone(),
+            cfg.udp_advertise_ip.clone(),
+            cfg.udp_max_datagram,
+            cfg.idle_timeout_secs,
+            cfg.udp_allow_private,
+        )
+    };
+    if !enabled {
+        let _ = reply(&mut stream, 0x07).await; // command not supported
+        bail!("udp associate disabled");
+    }
+    // 1. Authorization gate: the UDP socket carries no credentials, so the
+    //    authenticated control connection is the sole authorization.
+    if manager.is_blocked(&peer) {
+        let _ = reply(&mut stream, 0x02).await; // connection not allowed
+        bail!("control peer blocked");
+    }
+
+    // 2. Bind the client-facing relay socket on the bind interface (default =
+    //    the listener IP). Dual-stack caveat (S2): unmap a v4-mapped local IP.
+    let listener_ip = match stream.local_addr() {
+        Ok(a) => Manager::canonicalize_ip(a.ip()),
+        Err(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    };
+    let bind_ip: IpAddr = match bind_cfg.as_deref() {
+        Some(s) if !s.is_empty() => match s.parse() {
+            Ok(ip) => ip,
+            Err(_) => listener_ip,
+        },
+        _ => listener_ip,
+    };
+    let relay_sock = match UdpSocket::bind((bind_ip, 0)).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            let _ = reply(&mut stream, 0x01).await; // general failure
+            bail!("udp relay bind failed: {e}");
+        }
+    };
+    let bnd_port = relay_sock.local_addr()?.port();
+
+    // 3. Compute BND.ADDR: advertise override > concrete bind IP > wildcard
+    //    fallback (emit 0.0.0.0/:: + rely on client substitution; warn).
+    let bnd_ip: IpAddr = if let Some(a) = advertise.as_deref().filter(|s| !s.is_empty()) {
+        a.parse().unwrap_or(bind_ip)
+    } else if !bind_ip.is_unspecified() {
+        bind_ip
+    } else {
+        tracing::warn!(
+            "udp associate: wildcard bind with no udp_advertise_ip — BND.ADDR is \
+             ambiguous behind NAT; set udp_advertise_ip"
+        );
+        bind_ip
+    };
+    let mut rep = vec![VER, 0x00, 0x00];
+    match bnd_ip {
+        IpAddr::V4(v4) => {
+            rep.push(0x01);
+            rep.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            rep.push(0x04);
+            rep.extend_from_slice(&v6.octets());
+        }
+    }
+    rep.extend_from_slice(&bnd_port.to_be_bytes());
+    stream.write_all(&rep).await?;
+
+    let max_datagram = max_dg.filter(|n| *n > 0).unwrap_or(64 * 1024);
+    let idle_dur = idle
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60)); // UDP-specific default 60 s
+
+    // 4. Register + run, bound to the control connection (B1: full IP:port).
+    //    Clone the Arcs the relay loop needs so the closure owns them while
+    //    `tracked` borrows `manager`/`runtime`.
+    let loop_manager = manager.clone();
+    let loop_runtime = runtime.clone();
+    relay::tracked(
+        &manager.storage,
+        &runtime,
+        peer.to_string(),
+        "udp-associate".into(),
+        |entry| async move {
+            let idle_fut = relay::idle_watchdog(entry.clone(), Some(idle_dur));
+            // The recv-loop body is implemented in Task 7; for this task it is a
+            // placeholder that simply parks until torn down.
+            let recv_loop = udp_relay_loop(
+                loop_manager,
+                loop_runtime,
+                relay_sock.clone(),
+                peer,
+                entry.clone(),
+                max_datagram,
+                allow_private,
+            );
+            // Control-stream EOF read: one non-looped arm over a NON-zero buffer.
+            let mut ctrl_buf = [0u8; 1];
+            tokio::select! {
+                _ = recv_loop => {}
+                _ = stream.read(&mut ctrl_buf) => {} // Ok(0)=EOF, Err, or stray byte
+                _ = token.cancelled() => {}
+                _ = idle_fut => {}
+            }
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Placeholder relay loop — replaced by the per-datagram router in Task 7.
+async fn udp_relay_loop(
+    _manager: Arc<Manager>,
+    _runtime: Arc<ProxyRuntime>,
+    _relay_sock: Arc<UdpSocket>,
+    _peer: SocketAddr,
+    _entry: Arc<crate::manager::ConnEntry>,
+    _max_datagram: usize,
+    _allow_private: bool,
+) {
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
