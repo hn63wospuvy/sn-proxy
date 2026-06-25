@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::broadcast;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
@@ -413,12 +413,38 @@ impl Manager {
         }
         self.prepare_tls(&runtime)?;
 
-        let addr = runtime.config.lock().unwrap().listen_addr.clone();
+        let (addr, protocol) = {
+            let cfg = runtime.config.lock().unwrap();
+            (cfg.listen_addr.clone(), cfg.protocol)
+        };
+
+        let token = CancellationToken::new();
+
+        if protocol == Protocol::Udp {
+            let socket = UdpSocket::bind(&addr)
+                .await
+                .map_err(|e| anyhow!("cannot bind {addr}: {e}"))?;
+            let socket = Arc::new(socket);
+            *runtime.cancel.lock().unwrap() = Some(token.clone());
+            runtime.running.store(true, Ordering::SeqCst);
+            {
+                let mut cfg = runtime.config.lock().unwrap();
+                cfg.enabled = true;
+                self.storage.save_config(&cfg)?;
+            }
+            let manager = self.clone();
+            let rt = runtime.clone();
+            tokio::spawn(async move {
+                crate::udp::serve(manager, rt, socket, token).await;
+            });
+            tracing::info!("proxy {id} listening on {addr} (udp)");
+            return Ok(());
+        }
+
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| anyhow!("cannot bind {addr}: {e}"))?;
 
-        let token = CancellationToken::new();
         *runtime.cancel.lock().unwrap() = Some(token.clone());
         runtime.running.store(true, Ordering::SeqCst);
         {
@@ -804,5 +830,21 @@ mod tests {
         // non-matching port-specific entry
         let rt_miss = runtime_with_blocklist(vec!["7.7.7.7:9999".into()]);
         assert!(!m.peer_blocked(&rt_miss, &peer));
+    }
+
+    #[tokio::test]
+    async fn start_udp_binds_udp_not_tcp() {
+        let m = temp_manager();
+        let cfg = m.create(udp_spec(Some("127.0.0.1:65000"))).unwrap();
+        let rt = m.proxies.get(&cfg.id).unwrap().clone();
+        rt.config.lock().unwrap().listen_addr = "127.0.0.1:45999".into();
+        m.start(&cfg.id).await.unwrap();
+        assert!(rt.running.load(Ordering::SeqCst));
+        // The UDP port must now be occupied (proves a UDP bind happened).
+        assert!(std::net::UdpSocket::bind("127.0.0.1:45999").is_err());
+        // The TCP port of the same number must still be free (proves we did
+        // NOT bind a TcpListener for a UDP proxy).
+        assert!(std::net::TcpListener::bind("127.0.0.1:45999").is_ok());
+        m.stop(&cfg.id).unwrap();
     }
 }
