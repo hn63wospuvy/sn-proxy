@@ -45,6 +45,14 @@ pub struct ProxySnapshot {
     pub has_truststore: bool,
     /// Whether the HTTPS listener requires client certificates (mTLS).
     pub mtls_required: bool,
+    /// Whether CMD=0x03 UDP ASSOCIATE is enabled (SOCKS5 only).
+    pub udp_associate_enabled: bool,
+    /// Whether internal/SSRF-risky UDP destinations are allowed (UNSAFE).
+    pub udp_allow_private: bool,
+    pub udp_bind_addr: Option<String>,
+    pub udp_advertise_ip: Option<String>,
+    pub udp_max_datagram: Option<usize>,
+    pub udp_max_dests: Option<u32>,
     /// Source addresses blocked on this proxy specifically.
     pub blocklist: Vec<String>,
     pub total_connections: u64,

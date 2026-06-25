@@ -91,6 +91,12 @@ pub struct ProxySpec {
     pub server_truststore_p12: Option<String>,
     pub server_truststore_password: Option<String>,
     pub mtls_required: bool,
+    pub udp_associate_enabled: bool,
+    pub udp_allow_private: bool,
+    pub udp_bind_addr: Option<String>,
+    pub udp_advertise_ip: Option<String>,
+    pub udp_max_datagram: Option<usize>,
+    pub udp_max_dests: Option<u32>,
 }
 
 impl ProxySpec {
@@ -288,6 +294,12 @@ impl Manager {
             server_truststore_password: spec.server_truststore_password,
             mtls_required: spec.mtls_required,
             blocklist: Vec::new(),
+            udp_associate_enabled: spec.udp_associate_enabled,
+            udp_allow_private: spec.udp_allow_private,
+            udp_bind_addr: spec.udp_bind_addr,
+            udp_advertise_ip: spec.udp_advertise_ip,
+            udp_max_datagram: spec.udp_max_datagram,
+            udp_max_dests: spec.udp_max_dests,
             enabled: false,
         };
         self.storage.save_config(&cfg)?;
@@ -318,6 +330,12 @@ impl Manager {
             cfg.connect_timeout_secs = spec.connect_timeout_secs;
             cfg.override_headers = spec.override_headers;
             cfg.mtls_required = spec.mtls_required;
+            cfg.udp_associate_enabled = spec.udp_associate_enabled;
+            cfg.udp_allow_private = spec.udp_allow_private;
+            cfg.udp_bind_addr = spec.udp_bind_addr;
+            cfg.udp_advertise_ip = spec.udp_advertise_ip;
+            cfg.udp_max_datagram = spec.udp_max_datagram;
+            cfg.udp_max_dests = spec.udp_max_dests;
 
             // Tri-state PKCS#12 fields: keep / clear / replace.
             match spec.client_p12 {
@@ -699,6 +717,12 @@ impl Manager {
                 has_server_p12: cfg.server_p12.is_some(),
                 has_truststore: cfg.server_truststore_p12.is_some(),
                 mtls_required: cfg.mtls_required,
+                udp_associate_enabled: cfg.udp_associate_enabled,
+                udp_allow_private: cfg.udp_allow_private,
+                udp_bind_addr: cfg.udp_bind_addr.clone(),
+                udp_advertise_ip: cfg.udp_advertise_ip.clone(),
+                udp_max_datagram: cfg.udp_max_datagram,
+                udp_max_dests: cfg.udp_max_dests,
                 blocklist: {
                     let mut bl = cfg.blocklist.clone();
                     bl.sort();
@@ -745,6 +769,12 @@ mod tests {
             server_truststore_p12: None,
             server_truststore_password: None,
             mtls_required: false,
+            udp_associate_enabled: true,
+            udp_allow_private: false,
+            udp_bind_addr: None,
+            udp_advertise_ip: None,
+            udp_max_datagram: None,
+            udp_max_dests: None,
         }
     }
 
@@ -801,6 +831,12 @@ mod tests {
             server_truststore_password: None,
             mtls_required: false,
             blocklist: list,
+            udp_associate_enabled: true,
+            udp_allow_private: false,
+            udp_bind_addr: None,
+            udp_advertise_ip: None,
+            udp_max_datagram: None,
+            udp_max_dests: None,
             enabled: false,
         };
         ProxyRuntime::new(config)

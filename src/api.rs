@@ -185,6 +185,18 @@ struct ProxyForm {
     server_truststore_password: Option<String>,
     #[serde(default)]
     mtls_required: bool,
+    #[serde(default = "crate::model::model_default_true")]
+    udp_associate_enabled: bool,
+    #[serde(default)]
+    udp_allow_private: bool,
+    #[serde(default)]
+    udp_bind_addr: Option<String>,
+    #[serde(default)]
+    udp_advertise_ip: Option<String>,
+    #[serde(default)]
+    udp_max_datagram: Option<usize>,
+    #[serde(default)]
+    udp_max_dests: Option<u32>,
 }
 
 impl ProxyForm {
@@ -218,6 +230,12 @@ impl ProxyForm {
             server_truststore_p12: self.server_truststore_p12,
             server_truststore_password: blank(self.server_truststore_password),
             mtls_required: self.mtls_required,
+            udp_associate_enabled: self.udp_associate_enabled,
+            udp_allow_private: self.udp_allow_private,
+            udp_bind_addr: blank(self.udp_bind_addr),
+            udp_advertise_ip: blank(self.udp_advertise_ip),
+            udp_max_datagram: self.udp_max_datagram.filter(|n| *n > 0),
+            udp_max_dests: self.udp_max_dests.filter(|n| *n > 0),
         }
     }
 }

@@ -61,6 +61,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Re-export of `default_true` for `serde(default = ...)` in other modules.
+pub fn model_default_true() -> bool {
+    true
+}
+
 /// Persisted configuration of a single proxy instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -137,6 +142,26 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub blocklist: Vec<String>,
 
+    // --- SOCKS5 UDP ASSOCIATE (Protocol::Socks5 only) ---
+    /// Gate CMD=0x03 UDP ASSOCIATE; when false the server replies `0x07`.
+    #[serde(default = "default_true")]
+    pub udp_associate_enabled: bool,
+    /// Allow internal/RFC1918/SSRF-risky UDP destinations. UNSAFE when true.
+    #[serde(default)]
+    pub udp_allow_private: bool,
+    /// Interface/IP the relay `UdpSocket` binds to (default = listener IP).
+    #[serde(default)]
+    pub udp_bind_addr: Option<String>,
+    /// IP reported in BND.ADDR (NAT / multi-homed override).
+    #[serde(default)]
+    pub udp_advertise_ip: Option<String>,
+    /// Max relayed datagram payload size (default 64 KiB).
+    #[serde(default)]
+    pub udp_max_datagram: Option<usize>,
+    /// Optional cap on distinct destinations per association (unset = unlimited).
+    #[serde(default)]
+    pub udp_max_dests: Option<u32>,
+
     /// Whether the proxy should be running.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -164,4 +189,25 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_defaults_udp_fields() {
+        // A config written before the udp_* fields existed must deserialize,
+        // defaulting associate=ON, allow_private=OFF, the rest None.
+        let json = r#"{
+            "id": "x", "name": "n", "listen_addr": "0.0.0.0:1080"
+        }"#;
+        let cfg: ProxyConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.udp_associate_enabled);
+        assert!(!cfg.udp_allow_private);
+        assert_eq!(cfg.udp_bind_addr, None);
+        assert_eq!(cfg.udp_advertise_ip, None);
+        assert_eq!(cfg.udp_max_datagram, None);
+        assert_eq!(cfg.udp_max_dests, None);
+    }
 }

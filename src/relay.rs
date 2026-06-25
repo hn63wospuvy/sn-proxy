@@ -343,6 +343,12 @@ mod tests {
             server_truststore_password: None,
             mtls_required: false,
             blocklist: Vec::new(),
+            udp_associate_enabled: true,
+            udp_allow_private: false,
+            udp_bind_addr: None,
+            udp_advertise_ip: None,
+            udp_max_datagram: None,
+            udp_max_dests: None,
             enabled: false,
         };
         Arc::new(ProxyRuntime::new(cfg))
