@@ -154,6 +154,7 @@
           <option value="https">HTTPS (TLS)</option>
           <option value="shadowsocks">Shadowsocks</option>
           <option value="tcp">TCP forwarder</option>
+          <option value="udp">UDP forwarder</option>
           <option value="websocket">WebSocket tunnel</option>
         </select>
       </div>
@@ -351,7 +352,7 @@ function render(proxies) {
         <span class="badge ${p.running ? "run" : "stop"}">${p.running ? "RUNNING" : "STOPPED"}</span>
         ${p.protocol === "shadowsocks"
           ? `<span class="badge auth">${esc(p.ss_method || "")}</span>`
-          : (p.protocol === "tcp" || p.protocol === "websocket")
+          : (p.protocol === "tcp" || p.protocol === "websocket" || p.protocol === "udp")
           ? `<span class="badge auth">→ ${esc(p.forward_to || "")}</span>`
           : (p.auth_enabled ? `<span class="badge auth">AUTH: ${esc(p.auth_username || "")}</span>` : "")}
         ${httpish && p.has_client_p12 ? `<span class="badge auth">CLIENT-CERT</span>` : ""}
@@ -451,11 +452,12 @@ function onProtoChange() {
   const ss = proto === "shadowsocks";
   const tcp = proto === "tcp";
   const ws = proto === "websocket";
+  const udp = proto === "udp";
   const http = proto === "http" || proto === "https";
-  $("rowUser").style.display = (ss || tcp) ? "none" : "";
+  $("rowUser").style.display = (ss || tcp || udp) ? "none" : "";
   $("rowCipher").style.display = ss ? "" : "none";
-  $("rowForward").style.display = (tcp || ws) ? "" : "none";
-  $("rowPass").style.display = tcp ? "none" : "";
+  $("rowForward").style.display = (tcp || ws || udp) ? "" : "none";
+  $("rowPass").style.display = (tcp || udp) ? "none" : "";
   $("secHttp").style.display = http ? "" : "none";
   $("secServerTls").style.display = (proto === "https") ? "" : "none";
   $("lblPass").textContent = ss ? "Password (required)" : "Password";
@@ -598,7 +600,7 @@ async function saveForm() {
   if (proto === "shadowsocks") {
     body.ss_method = $("fCipher").value;
     body.ss_password = $("fPass").value;
-  } else if (proto === "tcp") {
+  } else if (proto === "tcp" || proto === "udp") {
     body.forward_to = $("fForward").value.trim();
   } else {
     const user = $("fUser").value.trim();
@@ -622,7 +624,7 @@ async function saveForm() {
   if (!body.name || !body.listen_addr) {
     $("formErr").textContent = "Name and listen address are required."; return;
   }
-  if ((proto === "tcp" || proto === "websocket") && !body.forward_to) {
+  if ((proto === "tcp" || proto === "websocket" || proto === "udp") && !body.forward_to) {
     $("formErr").textContent = "This proxy needs a forward destination."; return;
   }
   const url = editId ? `/api/proxies/${editId}` : "/api/proxies";
