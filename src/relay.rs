@@ -205,6 +205,58 @@ pub async fn tracked<F, Fut>(
     }
 }
 
+/// Register a UDP session for monitoring: build a fresh [`ConnEntry`], insert
+/// it into `runtime.conns` and bump the connection counter. Mirrors the setup
+/// half of [`tracked`]. The returned entry's `cancel` token drives teardown.
+pub fn udp_session_start(
+    runtime: &Arc<ProxyRuntime>,
+    src: String,
+    dst: String,
+) -> Arc<ConnEntry> {
+    let conn_id = Uuid::new_v4().to_string();
+    let entry = Arc::new(ConnEntry {
+        id: conn_id.clone(),
+        src_addr: src,
+        dst_addr: dst,
+        bytes_sent: AtomicU64::new(0),
+        bytes_received: AtomicU64::new(0),
+        started_at: now_ms(),
+        cancel: CancellationToken::new(),
+    });
+    runtime.conns.insert(conn_id, entry.clone());
+    runtime.total_connections.fetch_add(1, Ordering::Relaxed);
+    entry
+}
+
+/// Tear down a UDP session: remove it from `runtime.conns`, fold its byte
+/// counters into the proxy totals and persist one history record. Mirrors the
+/// teardown half of [`tracked`]. MUST be called exactly once per session.
+pub fn udp_session_end(
+    storage: &Arc<Storage>,
+    runtime: &Arc<ProxyRuntime>,
+    entry: &Arc<ConnEntry>,
+) {
+    runtime.conns.remove(&entry.id);
+    let sent = entry.bytes_sent.load(Ordering::Relaxed);
+    let received = entry.bytes_received.load(Ordering::Relaxed);
+    runtime.total_sent.fetch_add(sent, Ordering::Relaxed);
+    runtime.total_received.fetch_add(received, Ordering::Relaxed);
+    let proxy_id = runtime.config.lock().unwrap().id.clone();
+    let record = ConnectionRecord {
+        id: entry.id.clone(),
+        proxy_id,
+        src_addr: entry.src_addr.clone(),
+        dst_addr: entry.dst_addr.clone(),
+        bytes_sent: sent,
+        bytes_received: received,
+        started_at: entry.started_at,
+        closed_at: Some(now_ms()),
+    };
+    if let Err(e) = storage.save_history(&record) {
+        tracing::warn!("save history failed: {e}");
+    }
+}
+
 /// Stream wrapper that tallies transferred bytes onto a [`ConnEntry`].
 ///
 /// Wrap the *client* side of a relay: bytes read from the client count as
@@ -257,5 +309,75 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counting<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manager::ProxyRuntime;
+    use crate::model::{Protocol, ProxyConfig};
+    use crate::storage::Storage;
+
+    fn runtime() -> Arc<ProxyRuntime> {
+        let cfg = ProxyConfig {
+            id: "px1".into(),
+            name: "n".into(),
+            protocol: Protocol::Udp,
+            listen_addr: "0.0.0.0:0".into(),
+            auth: None,
+            ss_method: None,
+            ss_password: None,
+            forward_to: Some("1.2.3.4:53".into()),
+            keepalive_secs: None,
+            idle_timeout_secs: None,
+            connect_timeout_secs: None,
+            client_p12: None,
+            client_p12_password: None,
+            client_p12_alias: None,
+            client_p12_entry_password: None,
+            override_headers: Vec::new(),
+            server_p12: None,
+            server_p12_password: None,
+            server_truststore_p12: None,
+            server_truststore_password: None,
+            mtls_required: false,
+            blocklist: Vec::new(),
+            enabled: false,
+        };
+        Arc::new(ProxyRuntime::new(cfg))
+    }
+
+    fn storage() -> Arc<Storage> {
+        let dir = std::env::temp_dir().join(format!("snproxy-relay-{}", Uuid::new_v4()));
+        Storage::open(dir.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn session_start_registers_conn() {
+        let rt = runtime();
+        let entry = udp_session_start(&rt, "5.5.5.5:40000".into(), "1.2.3.4:53".into());
+        assert_eq!(entry.src_addr, "5.5.5.5:40000");
+        assert_eq!(entry.dst_addr, "1.2.3.4:53");
+        assert_eq!(rt.conns.len(), 1);
+        assert_eq!(rt.total_connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn session_end_folds_totals_and_removes() {
+        let rt = runtime();
+        let st = storage();
+        let entry = udp_session_start(&rt, "5.5.5.5:40000".into(), "1.2.3.4:53".into());
+        entry.bytes_sent.store(100, Ordering::Relaxed);
+        entry.bytes_received.store(40, Ordering::Relaxed);
+        udp_session_end(&st, &rt, &entry);
+        assert_eq!(rt.conns.len(), 0);
+        assert_eq!(rt.total_sent.load(Ordering::Relaxed), 100);
+        assert_eq!(rt.total_received.load(Ordering::Relaxed), 40);
+        let recs = st.load_history("px1", 0, 10).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].proxy_id, "px1");
+        assert_eq!(recs[0].bytes_sent, 100);
+        assert!(recs[0].closed_at.is_some());
     }
 }

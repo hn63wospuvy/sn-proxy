@@ -51,7 +51,7 @@ pub struct ProxyRuntime {
 }
 
 impl ProxyRuntime {
-    fn new(config: ProxyConfig) -> Self {
+    pub(crate) fn new(config: ProxyConfig) -> Self {
         Self {
             config: Mutex::new(config),
             running: AtomicBool::new(false),
