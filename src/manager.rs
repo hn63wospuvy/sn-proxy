@@ -541,9 +541,23 @@ impl Manager {
     }
 
     /// Whether a peer is blocked manager-wide, by full `IP:port` or bare IP.
-    fn is_blocked(&self, peer: &SocketAddr) -> bool {
+    pub(crate) fn is_blocked(&self, peer: &SocketAddr) -> bool {
         let bl = self.blocklist.lock().unwrap();
         bl.contains(&peer.to_string()) || bl.contains(&peer.ip().to_string())
+    }
+
+    /// Whether a peer is blocked for `runtime`: the OR of the manager-wide
+    /// blocklist and the proxy's own `blocklist`. The per-proxy match compares
+    /// each entry against both the full `IP:port` and the bare IP, mirroring
+    /// the inline check the TCP accept loop used to run.
+    pub(crate) fn peer_blocked(&self, runtime: &ProxyRuntime, peer: &SocketAddr) -> bool {
+        if self.is_blocked(peer) {
+            return true;
+        }
+        let cfg = runtime.config.lock().unwrap();
+        cfg.blocklist
+            .iter()
+            .any(|a| *a == peer.to_string() || *a == peer.ip().to_string())
     }
 
     async fn accept_loop(
@@ -557,12 +571,7 @@ impl Manager {
                 _ = token.cancelled() => break,
                 res = listener.accept() => match res {
                     Ok((stream, peer)) => {
-                        let blocked = manager.is_blocked(&peer) || {
-                            let cfg = runtime.config.lock().unwrap();
-                            cfg.blocklist.iter().any(|a| {
-                                *a == peer.to_string() || *a == peer.ip().to_string()
-                            })
-                        };
+                        let blocked = manager.peer_blocked(&runtime, &peer);
                         if blocked {
                             tracing::debug!("rejected blocked peer {peer}");
                             continue;
@@ -684,6 +693,9 @@ impl Manager {
 mod tests {
     use super::*;
     use crate::model::Protocol;
+    use crate::model::ProxyConfig;
+    use crate::storage::Storage;
+    use std::net::SocketAddr;
 
     fn udp_spec(forward_to: Option<&str>) -> ProxySpec {
         ProxySpec {
@@ -720,5 +732,77 @@ mod tests {
         assert!(udp_spec(None).validate().is_err());
         assert!(udp_spec(Some("")).validate().is_err());
         assert!(udp_spec(Some("1.2.3.4:53")).validate().is_ok());
+    }
+
+    fn temp_manager() -> Arc<Manager> {
+        let dir = std::env::temp_dir().join(format!("snproxy-test-{}", Uuid::new_v4()));
+        let storage = Storage::open(dir.to_str().unwrap()).unwrap();
+        let (events, _) = broadcast::channel(16);
+        Arc::new(Manager {
+            storage,
+            proxies: DashMap::new(),
+            events,
+            admin: AdminAuth::new(Vec::new()),
+            tls: crate::tls::acceptor(None, None).unwrap(),
+            default_connector: crate::tls::plain_connector(),
+            blocklist: Mutex::new(HashSet::new()),
+        })
+    }
+
+    fn runtime_with_blocklist(list: Vec<String>) -> ProxyRuntime {
+        let mut cfg = udp_spec(Some("1.2.3.4:53"));
+        // ProxySpec -> a minimal ProxyConfig carrying only what peer_blocked reads.
+        let config = ProxyConfig {
+            id: Uuid::new_v4().to_string(),
+            name: cfg.name.clone(),
+            protocol: Protocol::Udp,
+            listen_addr: cfg.listen_addr.clone(),
+            auth: None,
+            ss_method: None,
+            ss_password: None,
+            forward_to: cfg.forward_to.take(),
+            keepalive_secs: None,
+            idle_timeout_secs: None,
+            connect_timeout_secs: None,
+            client_p12: None,
+            client_p12_password: None,
+            client_p12_alias: None,
+            client_p12_entry_password: None,
+            override_headers: Vec::new(),
+            server_p12: None,
+            server_p12_password: None,
+            server_truststore_p12: None,
+            server_truststore_password: None,
+            mtls_required: false,
+            blocklist: list,
+            enabled: false,
+        };
+        ProxyRuntime::new(config)
+    }
+
+    #[test]
+    fn peer_blocked_matches_manager_wide_ip() {
+        let m = temp_manager();
+        m.block("9.9.9.9").unwrap();
+        let rt = runtime_with_blocklist(Vec::new());
+        let peer: SocketAddr = "9.9.9.9:5000".parse().unwrap();
+        assert!(m.peer_blocked(&rt, &peer));
+        let other: SocketAddr = "8.8.8.8:5000".parse().unwrap();
+        assert!(!m.peer_blocked(&rt, &other));
+    }
+
+    #[test]
+    fn peer_blocked_matches_per_proxy_ip_and_ipport() {
+        let m = temp_manager();
+        let peer: SocketAddr = "7.7.7.7:1234".parse().unwrap();
+        // bare IP entry
+        let rt_ip = runtime_with_blocklist(vec!["7.7.7.7".into()]);
+        assert!(m.peer_blocked(&rt_ip, &peer));
+        // full IP:port entry
+        let rt_full = runtime_with_blocklist(vec!["7.7.7.7:1234".into()]);
+        assert!(m.peer_blocked(&rt_full, &peer));
+        // non-matching port-specific entry
+        let rt_miss = runtime_with_blocklist(vec!["7.7.7.7:9999".into()]);
+        assert!(!m.peer_blocked(&rt_miss, &peer));
     }
 }
