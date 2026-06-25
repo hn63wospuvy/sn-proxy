@@ -5,7 +5,7 @@
 
 use crate::manager::{ConnEntry, Manager, ProxyRuntime};
 use crate::relay;
-use crate::udp_socks::{ParsedHost, parse_udp_request};
+use crate::udp_socks::{ParsedHost, build_udp_reply_header, parse_udp_request};
 use anyhow::{Result, bail};
 use dashmap::DashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -497,17 +497,40 @@ async fn forward_one(
     }
 }
 
-/// Reply task: relay `dest`'s answers back to the pinned client. Implemented
-/// in Task 8.
+/// Reply task: relay `dest`'s answers back to the pinned client. Loops `recv`
+/// on the connected outbound socket, frames each reply with the responder's
+/// literal IP, sends it to the pinned client, accounts payload-only, and
+/// removes itself from `dests` on exit.
 fn spawn_reply_task(
-    _relay_sock: Arc<UdpSocket>,
-    _dest_sock: Arc<UdpSocket>,
-    _entry: Arc<ConnEntry>,
-    _client: SocketAddr,
-    _dests: Arc<DashMap<SocketAddr, Arc<DestEntry>>>,
-    _canon: SocketAddr,
+    relay_sock: Arc<UdpSocket>,
+    dest_sock: Arc<UdpSocket>,
+    entry: Arc<ConnEntry>,
+    client: SocketAddr,
+    dests: Arc<DashMap<SocketAddr, Arc<DestEntry>>>,
+    canon: SocketAddr,
 ) {
-    // Task 8.
+    tokio::spawn(async move {
+        // Reply header is always a literal IP → worst case IPv6 (22 bytes).
+        let mut buf = vec![0u8; 64 * 1024 + 22];
+        loop {
+            let n = tokio::select! {
+                _ = entry.cancel.cancelled() => break,
+                r = dest_sock.recv(&mut buf) => match r {
+                    Ok(n) => n,
+                    Err(_) => break, // outbound socket error
+                },
+            };
+            // `connect()`-ed socket only delivers from `canon`, so the responder
+            // is the canonical dest; frame a literal-IP reply header.
+            let mut out = build_udp_reply_header(canon);
+            out.extend_from_slice(&buf[..n]);
+            if relay_sock.send_to(&out, client).await.is_err() {
+                break;
+            }
+            entry.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        dests.remove(&canon);
+    });
 }
 
 #[cfg(test)]

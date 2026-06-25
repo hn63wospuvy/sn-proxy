@@ -101,6 +101,39 @@ def test_reflection_guard(sport):
     ctrl.close(); echo.close(); cli.close(); other.close()
     print("OK test_reflection_guard")
 
+def test_domain_literal_reply(sport):
+    # The relay resolves the domain via the OS and forwards to the FIRST
+    # address returned. On some hosts (notably Windows) "localhost" resolves to
+    # ::1 before 127.0.0.1, so the echo server must accept both families: bind a
+    # dual-stack IPv6 socket (IPV6_V6ONLY=0). Skip if the host lacks IPv6.
+    fams = {ai[0] for ai in socket.getaddrinfo("localhost", 0, type=socket.SOCK_DGRAM)}
+    try:
+        echo = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        echo.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        echo.bind(("::", 0))
+        eport = echo.getsockname()[1]
+    except OSError:
+        # No IPv6 / dual-stack: fall back to an IPv4 echo server. Only valid if
+        # localhost does not prefer IPv6.
+        if socket.AF_INET6 in fams:
+            print("SKIP test_domain_literal_reply (no dual-stack; localhost prefers IPv6)")
+            return
+        echo, eport = udp_echo_server()
+    ctrl = socket.create_connection((HOST, sport))
+    bnd_ip, bnd_port = socks_associate(ctrl)
+    cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    name = b"localhost"
+    pkt = b"\x00\x00\x00\x03" + bytes([len(name)]) + name + struct.pack("!H", eport) + b"q"
+    cli.sendto(pkt, (bnd_ip, bnd_port))
+    echo.settimeout(2); data, src = echo.recvfrom(2048)
+    echo.sendto(b"r", src)
+    cli.settimeout(2); rep, _ = cli.recvfrom(2048)
+    h = parse_reply(rep)
+    assert h["atyp"] in (0x01, 0x04), "reply ATYP must be literal, never 0x03"
+    assert h["data"] == b"r"
+    ctrl.close(); echo.close(); cli.close()
+    print("OK test_domain_literal_reply")
+
 def boot_and_create(udp_enabled=True, allow_private=False):
     data = tempfile.mkdtemp(prefix="snudp-")
     admin_port = 18080
@@ -156,5 +189,6 @@ if __name__ == "__main__":
         test_frag_dropped(sport)
         test_reflection_guard(sport)
         test_echo_roundtrip(sport)
+        test_domain_literal_reply(sport)
     finally:
         shutdown(proc)
