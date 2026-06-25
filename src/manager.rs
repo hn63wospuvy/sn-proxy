@@ -8,7 +8,7 @@ use crate::{http, relay, shadowsocks, socks5, tcp, tls, ws_proxy};
 use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, UdpSocket};
@@ -604,6 +604,71 @@ impl Manager {
             .any(|a| *a == peer.to_string() || *a == peer.ip().to_string())
     }
 
+    /// Canonicalize a v4-embedding IPv6 to its IPv4 form: `::ffff:0:0/96`
+    /// (v4-mapped), the NAT64 well-known prefix `64:ff9b::/96`, and the
+    /// deprecated IPv4-compatible `::a.b.c.d`. Other addresses pass through.
+    #[allow(dead_code)] // consumed by the SOCKS5 UDP relay (Tasks 6-7).
+    pub(crate) fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+        let IpAddr::V6(v6) = ip else { return ip };
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return IpAddr::V4(v4);
+        }
+        let seg = v6.segments();
+        // NAT64 64:ff9b::/96 — last 32 bits are the embedded v4.
+        if seg[0] == 0x0064
+            && seg[1] == 0xff9b
+            && seg[2] == 0
+            && seg[3] == 0
+            && seg[4] == 0
+            && seg[5] == 0
+        {
+            let o = v6.octets();
+            return IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+        }
+        // Deprecated IPv4-compatible ::a.b.c.d (high 96 bits zero, not ::/::1).
+        if seg[0] == 0
+            && seg[1] == 0
+            && seg[2] == 0
+            && seg[3] == 0
+            && seg[4] == 0
+            && seg[5] == 0
+            && !(seg[6] == 0 && seg[7] == 0)
+            && !(seg[6] == 0 && seg[7] == 1)
+        {
+            let o = v6.octets();
+            return IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+        }
+        ip
+    }
+
+    /// Whether a UDP destination is internal/SSRF-risky and must be blocked when
+    /// `udp_allow_private` is false. Canonicalizes v4-embedding IPv6 first, then
+    /// applies the v4 ruleset; otherwise applies the native v6 ranges.
+    #[allow(dead_code)] // consumed by the SOCKS5 UDP relay (Task 7).
+    pub(crate) fn is_internal_dest(ip: IpAddr) -> bool {
+        match Self::canonicalize_ip(ip) {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_multicast()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+                    || o[0] == 100 && (64..=127).contains(&o[1]) // CGNAT 100.64/10
+            }
+            IpAddr::V6(v6) => {
+                let seg = v6.segments();
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (seg[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                    || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                    || (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 prefix itself
+            }
+        }
+    }
+
     async fn accept_loop(
         manager: Arc<Self>,
         runtime: Arc<ProxyRuntime>,
@@ -882,5 +947,63 @@ mod tests {
         // NOT bind a TcpListener for a UDP proxy).
         assert!(std::net::TcpListener::bind("127.0.0.1:45999").is_ok());
         m.stop(&cfg.id).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod udp_internal_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn v4_internal_ranges_blocked() {
+        assert!(Manager::is_internal_dest(v4(127, 0, 0, 1))); // loopback
+        assert!(Manager::is_internal_dest(v4(10, 0, 0, 5))); // RFC1918
+        assert!(Manager::is_internal_dest(v4(192, 168, 1, 1)));
+        assert!(Manager::is_internal_dest(v4(172, 16, 9, 9)));
+        assert!(Manager::is_internal_dest(v4(169, 254, 169, 254))); // metadata
+        assert!(Manager::is_internal_dest(v4(100, 64, 0, 1))); // CGNAT
+        assert!(Manager::is_internal_dest(v4(0, 0, 0, 0))); // unspecified
+        assert!(Manager::is_internal_dest(v4(224, 0, 0, 1))); // multicast
+        assert!(Manager::is_internal_dest(v4(255, 255, 255, 255))); // broadcast
+    }
+
+    #[test]
+    fn public_v4_allowed() {
+        assert!(!Manager::is_internal_dest(v4(8, 8, 8, 8)));
+        assert!(!Manager::is_internal_dest(v4(1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn v6_native_ranges_blocked() {
+        assert!(Manager::is_internal_dest(IpAddr::V6(Ipv6Addr::LOCALHOST))); // ::1
+        assert!(Manager::is_internal_dest(IpAddr::V6(Ipv6Addr::UNSPECIFIED))); // ::
+        assert!(Manager::is_internal_dest("fc00::1".parse().unwrap())); // ULA
+        assert!(Manager::is_internal_dest("fe80::1".parse().unwrap())); // link-local
+        assert!(Manager::is_internal_dest("ff02::1".parse().unwrap())); // multicast
+    }
+
+    #[test]
+    fn public_v6_allowed() {
+        assert!(!Manager::is_internal_dest("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn v4_mapped_v6_unmapped_and_blocked() {
+        // ::ffff:7f00:1 == 127.0.0.1 ; ::ffff:a9fe:a9fe == 169.254.169.254
+        assert!(Manager::is_internal_dest("::ffff:7f00:1".parse().unwrap()));
+        assert!(Manager::is_internal_dest("::ffff:a9fe:a9fe".parse().unwrap()));
+        // ::ffff:8.8.8.8 is still public after unmapping
+        assert!(!Manager::is_internal_dest("::ffff:808:808".parse().unwrap()));
+    }
+
+    #[test]
+    fn nat64_wrapper_of_internal_blocked() {
+        // 64:ff9b::7f00:1 wraps 127.0.0.1
+        assert!(Manager::is_internal_dest("64:ff9b::7f00:1".parse().unwrap()));
     }
 }
