@@ -387,3 +387,23 @@ async fn ws_handler(State(m): State<Arc<Manager>>, ws: IncomingUpgrade) -> impl 
     });
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_form_deserializes_and_passes_through() {
+        let json = r#"{
+            "name":"u","protocol":"udp","listen_addr":"0.0.0.0:5000",
+            "forward_to":"8.8.8.8:53","idle_timeout_secs":0
+        }"#;
+        let form: ProxyForm = serde_json::from_str(json).unwrap();
+        assert_eq!(form.protocol, Protocol::Udp);
+        let spec = form.into_spec();
+        assert_eq!(spec.protocol, Protocol::Udp);
+        assert_eq!(spec.forward_to.as_deref(), Some("8.8.8.8:53"));
+        // 0 is coerced to None by nonzero(); udp::serve applies the 60 s default.
+        assert_eq!(spec.idle_timeout_secs, None);
+    }
+}
