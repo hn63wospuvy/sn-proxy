@@ -16,6 +16,7 @@ mod socks5;
 mod storage;
 mod tcp;
 mod tls;
+mod udp;
 mod ws;
 mod ws_proxy;
 
