@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1.0.102"
+argon2 = "0.5"
 axum = "0.8.9"
 base64 = "0.22.1"
 chacha20poly1305 = "0.10.1"
@@ -29,5 +30,11 @@ tokio = { version = "1.52.3", features = ["full"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tracing = "0.1.44"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.23.1", features = ["v4"] }
+
+# Unix-only: setsid() in the daemonize pre_exec hook. On Windows we use
+# CommandExt::creation_flags instead (std, no extra dependency).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

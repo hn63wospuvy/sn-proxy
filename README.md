@@ -63,16 +63,21 @@ Then open the web admin at <http://localhost:8080>.
 
 Command-line options:
 
-| Option                       | Default        | Description                                                                 |
-|-------------------------------|----------------|-----------------------------------------------------------------------------|
-| `-c`, `--config <FILE>`       | —              | Properties config file (see below)                                          |
-| `-p`, `--port <[HOST:]PORT>`  | `0.0.0.0:8080` | Web admin address. A bare port binds every interface; `HOST:PORT` binds one  |
-| `-d`, `--data-dir <DIR>`      | `data`         | RocksDB data directory                                                      |
-| `-h`, `--help`                | —              | Print help and exit                                                         |
+| Option                          | Default        | Description                                                                 |
+|----------------------------------|----------------|-----------------------------------------------------------------------------|
+| `-c`, `--config <FILE>`          | —              | Properties config file (see below)                                          |
+| `-p`, `--port <[HOST:]PORT>`     | `0.0.0.0:8080` | Web admin address. A bare port binds every interface; `HOST:PORT` binds one  |
+| `-d`, `--data-dir <DIR>`         | `data`         | RocksDB data directory                                                      |
+| `-m`, `--mode <daemon\|foreground>` | `daemon`    | Run backgrounded (default) or attached to the console (see *Run mode*)      |
+| `-h`, `--help`                   | —              | Print help and exit                                                         |
+
+`-p` / `-d` / `-m` override the config file.
 
 ```sh
 cargo run --release -- --config config.properties
 cargo run --release -- --port 127.0.0.1:9991 --data-dir /var/lib/sn-proxy
+# stay attached to the console (handy in development):
+cargo run --release -- --mode foreground
 ```
 
 ### Config file
@@ -87,10 +92,12 @@ override it. See [`config.example.properties`](config.example.properties).
 | `tls_cert`       | PEM certificate for the `https` proxy (else a self-signed one)   |
 | `tls_key`        | PEM private key for the `https` proxy                            |
 | `admin_user`     | Web admin login username — setting it (with a password) enables login |
-| `admin_password` | Web admin login password                                         |
+| `admin_password` | Web admin login password — plaintext or an `$argon2` hash (see *Admin passwords*) |
 | `admin_network`  | Restrict that admin's login to a CIDR, e.g. `192.168.1.0/24`     |
 | `admin.<NAME>.password` | An additional admin account (multi-admin form)            |
 | `admin.<NAME>.network`  | That admin's allowed CIDR (optional)                      |
+| `mode`           | `daemon` (background, default) or `foreground` (see *Run mode*)  |
+| `log_file`       | Daily-rotated log file; off when unset (see *Logging*)           |
 
 Configuring at least one admin makes the web admin require sign-in (cookie
 session); otherwise it is open. Each admin may have its own `network` CIDR —
@@ -100,6 +107,54 @@ without a network may sign in from anywhere. `RUST_LOG` (default
 
 Proxy configs are persisted; proxies that were running are auto-started on the
 next launch.
+
+### Admin passwords
+
+An `admin_password` (or `admin.<NAME>.password`) may be either plaintext or an
+**argon2** PHC hash — a string beginning with `$argon2` such as
+`$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`. When the stored value is a hash
+it is verified with argon2 at login (the variant and cost parameters are read
+from the hash); otherwise the comparison is plaintext. Plaintext still works but
+logs a warning at startup — prefer a hash. Generate one with any argon2 tool,
+e.g. Python's `argon2-cffi`:
+
+```sh
+python -c "from argon2 import PasswordHasher as P; print(P().hash('your-password'))"
+```
+
+### Run mode
+
+`mode` (or `-m` / `--mode`) selects how the process runs. It defaults to
+**`daemon`**: on startup the process re-spawns itself detached from the console,
+prints `started in background, pid <N>` (also written to
+`<data_dir>/sn-proxy.pid`) and the foreground command returns immediately. Stop
+it with the OS using that pid (`taskkill /PID <N>` on Windows, `kill <N>` on
+Unix). Before backgrounding, the parent does a pre-flight bind of the web-admin
+port, so a port-in-use error is reported on the console instead of vanishing
+into the background.
+
+Use `mode=foreground` (or `--mode foreground`) to stay attached — the process
+runs in the current console and logs to stdout, which is what you usually want
+during development and under a service manager (systemd, nssm, …).
+
+> Note: because the default is daemon, a plain `cargo run` now detaches and
+> returns. Use `cargo run -- --mode foreground` to keep it in the foreground.
+
+### Logging
+
+By default logs go to stdout. Set `log_file` to also write them to a file that
+**rotates daily** (old files are kept, never auto-deleted). The value is a
+directory or a file path:
+
+- a value ending in a path separator (`logs/`) is a directory; files are named
+  `sn-proxy.<YYYY-MM-DD>` inside it;
+- otherwise the last path component is the filename prefix
+  (`logs/proxy.log` → `logs/proxy.log.<YYYY-MM-DD>`).
+
+The directory is created if missing. In **foreground** mode logs are written to
+both the file and stdout; in **daemon** mode the console is detached, so a
+daemon with no `log_file` discards its logs (a warning is printed before it
+backgrounds). `RUST_LOG` (default `sn_proxy=info`) filters file output too.
 
 ## Using a proxy
 

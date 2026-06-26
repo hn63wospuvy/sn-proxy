@@ -6,6 +6,7 @@ use crate::monitor::{ActiveConn, MonitorEvent, ProxySnapshot};
 use crate::storage::Storage;
 use crate::{http, relay, shadowsocks, socks5, tcp, tls, ws_proxy};
 use anyhow::{Result, anyhow, bail};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -129,6 +130,26 @@ impl ProxySpec {
     }
 }
 
+/// Verify a candidate password against a stored value.
+///
+/// If the stored value is an argon2 PHC string (`$argon2…`) it is verified with
+/// argon2 (the variant and m/t/p parameters are read from the hash itself);
+/// otherwise the comparison is plaintext. A value that looks like an argon2
+/// hash but fails to parse never authenticates — it does not fall back to
+/// plaintext.
+fn verify_password(stored: &str, candidate: &str) -> bool {
+    if stored.starts_with("$argon2") {
+        match PasswordHash::new(stored) {
+            Ok(parsed) => Argon2::default()
+                .verify_password(candidate.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false, // malformed hash never authenticates
+        }
+    } else {
+        stored == candidate
+    }
+}
+
 /// One web-admin account, optionally restricted to a network range.
 pub struct Admin {
     pub username: String,
@@ -169,7 +190,7 @@ impl AdminAuth {
         let admin = self
             .admins
             .iter()
-            .find(|a| a.username == user && a.password == password)
+            .find(|a| a.username == user && verify_password(&a.password, password))
             .ok_or("invalid username or password")?;
         if let Some(net) = admin.network {
             if !net.contains(&client_ip) {
@@ -875,6 +896,57 @@ mod tests {
     #[test]
     fn udp_as_str_is_udp() {
         assert_eq!(Protocol::Udp.as_str(), "udp");
+    }
+
+    #[test]
+    fn verify_password_plaintext() {
+        assert!(verify_password("secret", "secret"));
+        assert!(!verify_password("secret", "wrong"));
+        assert!(!verify_password("secret", ""));
+    }
+
+    #[test]
+    fn verify_password_argon2_roundtrip() {
+        use argon2::password_hash::SaltString;
+        use argon2::{Argon2, PasswordHasher};
+        let salt = SaltString::from_b64("c29tZXNhbHQ").unwrap();
+        let hash = Argon2::default()
+            .hash_password(b"correct horse", &salt)
+            .unwrap()
+            .to_string();
+        assert!(hash.starts_with("$argon2"));
+        assert!(verify_password(&hash, "correct horse"));
+        assert!(!verify_password(&hash, "wrong"));
+        assert!(!verify_password(&hash, ""));
+    }
+
+    #[test]
+    fn check_accepts_argon2_admin_and_rejects_wrong_password() {
+        use argon2::password_hash::SaltString;
+        use argon2::{Argon2, PasswordHasher};
+        let salt = SaltString::from_b64("c29tZXNhbHQ").unwrap();
+        let hash = Argon2::default()
+            .hash_password(b"hunter2", &salt)
+            .unwrap()
+            .to_string();
+        let auth = AdminAuth::new(vec![Admin {
+            username: "alice".into(),
+            password: hash,
+            network: None,
+        }]);
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(auth.check("alice", "hunter2", ip).is_ok());
+        assert!(auth.check("alice", "nope", ip).is_err());
+        assert!(auth.check("bob", "hunter2", ip).is_err());
+    }
+
+    #[test]
+    fn verify_password_malformed_argon2_never_authenticates() {
+        // Looks like a PHC hash but is unparseable: must be refused, and must
+        // NOT fall back to plaintext (even when candidate equals the stored
+        // string).
+        assert!(!verify_password("$argon2id$broken", "anything"));
+        assert!(!verify_password("$argon2id$broken", "$argon2id$broken"));
     }
 
     #[test]

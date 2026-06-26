@@ -867,10 +867,12 @@ async function removeBlock(addr) {
 }
 
 // ---- protocol documentation ----
-// Tab order; the leading "overview" tab is general, the rest map 1:1 to the
-// values of the #fProto <select> so the form's info icon can deep-link to one.
+// Tab order; the leading "overview" and "server" tabs are general, the rest map
+// 1:1 to the values of the #fProto <select> so the form's info icon can
+// deep-link to one (it never selects "server", which has no #fProto value).
 const DOC_TABS = [
   { key: "overview",     label: "Overview" },
+  { key: "server",       label: "Server config" },
   { key: "socks5",       label: "SOCKS5" },
   { key: "http",         label: "HTTP" },
   { key: "https",        label: "HTTPS" },
@@ -925,6 +927,82 @@ const DOCS = {
     </ul>
     <div class="note ok">Set an idle timeout on internet-facing proxies so stalled or abandoned
       connections cannot pile up.</div>`,
+
+  server: `
+    <h3>Server configuration</h3>
+    <p class="lead">How the whole sn·proxy process is launched and configured — separate from the
+      per-proxy settings on the other tabs. Configure it with command-line flags and/or a properties
+      file; proxies themselves are created and edited here in the web admin.</p>
+
+    <h4>Command-line flags</h4>
+    <ul>
+      <li><span class="field"><code>-c</code>, <code>--config &lt;FILE&gt;</code></span> — path to a
+        properties config file (see below).</li>
+      <li><span class="field"><code>-p</code>, <code>--port &lt;[HOST:]PORT&gt;</code></span> — web-admin
+        address. A bare port binds <code>0.0.0.0</code>; <code>HOST:PORT</code> binds one interface.
+        Default <code>0.0.0.0:8080</code>.</li>
+      <li><span class="field"><code>-d</code>, <code>--data-dir &lt;DIR&gt;</code></span> — RocksDB data
+        directory (proxy configs + history). Default <code>data</code>.</li>
+      <li><span class="field"><code>-m</code>, <code>--mode &lt;daemon|foreground&gt;</code></span> — run
+        backgrounded (default) or attached. See <em>Run mode</em> below.</li>
+      <li><span class="field"><code>-h</code>, <code>--help</code></span> — print help and exit.</li>
+    </ul>
+    <p><code>-p</code> / <code>-d</code> / <code>-m</code> override the config file.</p>
+
+    <h4>Config file (properties)</h4>
+    <p>A <code>key=value</code> file; lines starting with <code>#</code> or <code>!</code> are comments.
+      All keys are optional.</p>
+    <ul>
+      <li><span class="field">port</span> — web-admin port or <code>HOST:PORT</code>.</li>
+      <li><span class="field">data_dir</span> — RocksDB data directory.</li>
+      <li><span class="field">tls_cert</span> / <span class="field">tls_key</span> — PEM cert + key for
+        the global <code>https</code> proxy certificate (a self-signed one is generated if omitted).</li>
+      <li><span class="field">admin_user</span> / <span class="field">admin_password</span> /
+        <span class="field">admin_network</span> — single web-admin account (shorthand). Setting an
+        admin enables sign-in.</li>
+      <li><span class="field">admin.&lt;NAME&gt;.password</span> /
+        <span class="field">admin.&lt;NAME&gt;.network</span> — additional admin accounts.</li>
+      <li><span class="field">mode</span> — <code>daemon</code> (default) or <code>foreground</code>.</li>
+      <li><span class="field">log_file</span> — daily-rotated log file; off when unset.</li>
+    </ul>
+    <p>Configuring at least one admin makes the web admin require sign-in (cookie session); otherwise it
+      is open. An admin with a <code>network</code> CIDR may only sign in from inside that range.</p>
+
+    <h4>Admin passwords (argon2)</h4>
+    <p>An admin password may be plaintext or an <strong>argon2</strong> PHC hash — a value starting with
+      <code>$argon2</code>, e.g. <code>$argon2id$v=19$m=19456,t=2,p=1$&lt;salt&gt;$&lt;hash&gt;</code>.
+      A hash is verified with argon2 at login (variant and cost parameters are read from the hash);
+      otherwise the comparison is plaintext. Generate one with any argon2 tool, e.g.
+      <code>python -c "from argon2 import PasswordHasher as P; print(P().hash('pw'))"</code>.</p>
+    <div class="note ok">Prefer an <code>$argon2</code> hash over a plaintext password — the config file
+      then never stores the password in the clear. Plaintext still works but logs a startup warning.</div>
+
+    <h4>Run mode</h4>
+    <p>Defaults to <span class="field">daemon</span>: the process re-spawns itself detached from the
+      console, prints <code>started in background, pid &lt;N&gt;</code> (also written to
+      <code>&lt;data_dir&gt;/sn-proxy.pid</code>) and returns immediately. Stop it with the OS using that
+      pid — <code>taskkill /PID &lt;N&gt;</code> (Windows) or <code>kill &lt;N&gt;</code> (Unix). Before
+      backgrounding, the parent pre-flight-binds the web-admin port, so a port-in-use error is reported
+      on the console instead of disappearing into the background.</p>
+    <p>Use <span class="field">foreground</span> (<code>mode=foreground</code> or
+      <code>--mode foreground</code>) to stay attached — best for development and under a service manager.</p>
+    <div class="note warn">Because the default is daemon, a plain <code>cargo run</code> detaches and
+      returns. Use <code>cargo run -- --mode foreground</code> to keep it attached.</div>
+
+    <h4>Logging</h4>
+    <p>Logs go to stdout by default. Set <span class="field">log_file</span> to also write a file that
+      <strong>rotates daily</strong> (old files are kept, never auto-deleted):</p>
+    <ul>
+      <li>a value ending in a path separator (<code>logs/</code>) is a <em>directory</em> — files are
+        named <code>sn-proxy.&lt;YYYY-MM-DD&gt;</code> inside it;</li>
+      <li>otherwise the last path component is the filename prefix
+        (<code>logs/proxy.log</code> → <code>logs/proxy.log.&lt;YYYY-MM-DD&gt;</code>).</li>
+    </ul>
+    <p>The directory is created if missing. In foreground mode logs go to both the file and stdout;
+      <code>RUST_LOG</code> (default <code>sn_proxy=info</code>) filters the file too.</p>
+    <div class="note bad">In <strong>daemon</strong> mode the console is detached, so a daemon with no
+      <code>log_file</code> <strong>discards its logs</strong> (a warning is printed before it
+      backgrounds). Set <code>log_file</code> when running as a daemon if you want to keep them.</div>`,
 
   socks5: `
     <h3>SOCKS5 <span class="hint">· RFC 1928 / 1929</span></h3>
