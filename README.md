@@ -15,8 +15,10 @@ realtime web admin. Everything runs on a single Tokio runtime.
 | `websocket`   | WebSocket tunnel (RFC 6455) to a fixed `host:port` destination |
 
 Each proxy also has optional advanced tuning: **TCP keep-alive** interval,
-**idle timeout** (drop connections with no traffic), and **connect timeout**
-(when dialing the destination).
+**idle timeout** (drop connections with no traffic), **connect timeout**
+(when dialing the destination), and a **max active connections** cap (new
+connections beyond it are refused at accept time; default `8888`, `0` =
+unlimited).
 
 ### HTTP / HTTPS extras
 
@@ -103,6 +105,7 @@ override it. See [`config.example.properties`](config.example.properties).
 | `admin_network`  | Restrict that admin's login to a CIDR, e.g. `192.168.1.0/24`     |
 | `admin.<NAME>.password` | An additional admin account (multi-admin form)            |
 | `admin.<NAME>.network`  | That admin's allowed CIDR (optional)                      |
+| `admin_https`    | `true` if the admin is reached over HTTPS — marks the session cookie `Secure` (default `false`) |
 | `mode`           | `daemon` (background, default) or `foreground` (see *Run mode*)  |
 | `log_file`       | Daily-rotated log file; off when unset (see *Logging*)           |
 
@@ -222,3 +225,11 @@ curl -x https://127.0.0.1:1082 --proxy-insecure https://example.com
 | `ws.rs`          | fastwebsockets monitoring feed                          |
 | `monitor.rs`     | Snapshot/event payloads                                 |
 | `model.rs`       | Shared data types                                       |
+
+## Security
+
+A security audit of the codebase (findings, what is fixed, and the known
+outstanding issues) is recorded in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md). Note
+in particular that the web admin is open by default — configure an admin account
+(and `admin_https` behind TLS) before exposing it — and that the upstream-TLS
+verification gap (H1) is still outstanding.

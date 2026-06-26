@@ -100,19 +100,39 @@ async fn login(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(form): Json<LoginForm>,
 ) -> Response {
-    match m.admin.check(&form.username, &form.password, addr.ip()) {
+    let ip = addr.ip();
+    // Brute-force throttle: reject once an IP exceeds the failed-attempt budget.
+    if let Some(retry_after) = m.admin.login_retry_after(ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(serde_json::json!({
+                "error": "too many login attempts — try again later"
+            })),
+        )
+            .into_response();
+    }
+    match m.admin.check(&form.username, &form.password, ip) {
         Ok(()) => {
+            m.admin.record_login_success(ip);
             let token = m.admin.create_session();
+            // `Secure` is added only when the admin is served over HTTPS
+            // (admin_https=true); adding it over plain HTTP would stop the
+            // browser from ever sending the cookie back, breaking login.
+            let secure = if m.admin.secure_cookies() { "; Secure" } else { "" };
             let cookie = format!(
-                "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400"
+                "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400{secure}"
             );
             ([(header::SET_COOKIE, cookie)], StatusCode::OK).into_response()
         }
-        Err(msg) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": msg })),
-        )
-            .into_response(),
+        Err(msg) => {
+            m.admin.record_login_failure(ip);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -198,6 +218,8 @@ struct ProxyForm {
     udp_max_datagram: Option<usize>,
     #[serde(default)]
     udp_max_dests: Option<u32>,
+    #[serde(default)]
+    max_connections: Option<u32>,
 }
 
 impl ProxyForm {
@@ -237,6 +259,9 @@ impl ProxyForm {
             udp_advertise_ip: blank(self.udp_advertise_ip),
             udp_max_datagram: self.udp_max_datagram.filter(|n| *n > 0),
             udp_max_dests: self.udp_max_dests.filter(|n| *n > 0),
+            // Pass through verbatim: `Some(0)` means "unlimited" (a deliberate
+            // operator choice), so it must NOT be coerced to `None`/the default.
+            max_connections: self.max_connections,
         }
     }
 }

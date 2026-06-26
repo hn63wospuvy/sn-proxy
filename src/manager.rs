@@ -1,7 +1,7 @@
 //! Owns every proxy instance: lifecycle (start/stop), live connection
 //! tracking and the broadcast channel feeding realtime monitoring.
 
-use crate::model::{BasicAuth, HeaderOverride, Protocol, ProxyConfig};
+use crate::model::{BasicAuth, HeaderOverride, Protocol, ProxyConfig, effective_max_connections};
 use crate::monitor::{ActiveConn, MonitorEvent, ProxySnapshot};
 use crate::resources::ResourceSample;
 use crate::storage::Storage;
@@ -13,8 +13,9 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -50,6 +51,9 @@ pub struct ProxyRuntime {
     /// Client-TLS connector presenting a PKCS#12 identity to upstream servers
     /// that require mutual TLS (HTTP/HTTPS proxies only).
     pub client_connector: Mutex<Option<Arc<TlsConnector>>>,
+    /// Recently-seen Shadowsocks client salts, for replay / nonce-reuse
+    /// detection. Bounded FIFO (see [`SaltCache`]). Shadowsocks proxies only.
+    ss_seen_salts: Mutex<SaltCache>,
 }
 
 impl ProxyRuntime {
@@ -64,7 +68,59 @@ impl ProxyRuntime {
             total_received: AtomicU64::new(0),
             https_acceptor: Mutex::new(None),
             client_connector: Mutex::new(None),
+            ss_seen_salts: Mutex::new(SaltCache::new(MAX_SEEN_SALTS)),
         }
+    }
+
+    /// Record a Shadowsocks client salt, returning `true` if it is new and
+    /// `false` if it has been seen recently (a replay / salt-reuse attempt).
+    ///
+    /// Reusing a salt re-derives the same session subkey while the AEAD nonce
+    /// restarts at zero, so accepting a duplicate salt would reuse a
+    /// `(key, nonce)` pair — catastrophic for AES-GCM / ChaCha20-Poly1305 — and
+    /// also enables straightforward traffic replay. The cache is a bounded FIFO,
+    /// so protection is best-effort over the last `MAX_SEEN_SALTS` salts.
+    pub(crate) fn note_ss_salt(&self, salt: &[u8]) -> bool {
+        self.ss_seen_salts.lock().unwrap().insert(salt)
+    }
+}
+
+/// Largest number of recent Shadowsocks salts remembered per proxy for replay
+/// detection (~32 bytes each + bookkeeping).
+const MAX_SEEN_SALTS: usize = 16_384;
+
+/// A bounded FIFO set of byte strings used for Shadowsocks salt-replay
+/// detection. Once `cap` entries are stored, inserting a new one evicts the
+/// oldest. Insertion reports whether the value was previously unseen.
+struct SaltCache {
+    set: HashSet<Vec<u8>>,
+    order: std::collections::VecDeque<Vec<u8>>,
+    cap: usize,
+}
+
+impl SaltCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: std::collections::VecDeque::with_capacity(cap.min(1024)),
+            cap,
+        }
+    }
+
+    /// Insert `value`; returns `true` when it was newly added, `false` when it
+    /// was already present (a replay).
+    fn insert(&mut self, value: &[u8]) -> bool {
+        if self.set.contains(value) {
+            return false;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(value.to_vec());
+        self.order.push_back(value.to_vec());
+        true
     }
 }
 
@@ -99,13 +155,24 @@ pub struct ProxySpec {
     pub udp_advertise_ip: Option<String>,
     pub udp_max_datagram: Option<usize>,
     pub udp_max_dests: Option<u32>,
+    pub max_connections: Option<u32>,
 }
 
 impl ProxySpec {
     /// Reject obviously invalid settings before they are persisted.
     fn validate(&self) -> Result<()> {
-        if self.name.trim().is_empty() {
+        let name = self.name.trim();
+        if name.is_empty() {
             bail!("name is required");
+        }
+        // Defense in depth against stored XSS: the name is rendered in the web
+        // admin. Control characters (incl. CR/LF and quotes' break-out helpers)
+        // are never legitimate in a display name; reject them and cap length.
+        if name.chars().any(|c| c.is_control()) {
+            bail!("name must not contain control characters");
+        }
+        if name.chars().count() > 200 {
+            bail!("name is too long (max 200 characters)");
         }
         if self.listen_addr.trim().is_empty() {
             bail!("listen address is required");
@@ -159,25 +226,82 @@ pub struct Admin {
     pub network: Option<ipnet::IpNet>,
 }
 
+/// Per-source-IP login throttling state (a fixed window of failures).
+struct LoginAttempts {
+    fails: u32,
+    window_start: std::time::Instant,
+}
+
+/// Max failed logins allowed from one source IP within [`LOGIN_WINDOW`] before
+/// further attempts are rejected with HTTP 429.
+const MAX_LOGIN_FAILS: u32 = 10;
+/// Rolling window over which [`MAX_LOGIN_FAILS`] is counted.
+const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+
 /// Web-admin accounts and active sessions.
 ///
 /// When the admin list is empty the web admin is open (no login).
 pub struct AdminAuth {
     admins: Vec<Admin>,
     sessions: Mutex<HashSet<String>>,
+    /// Whether to mark the session cookie `Secure` (admin served over HTTPS).
+    secure_cookies: bool,
+    /// Per-IP failed-login counters for brute-force rate limiting.
+    login_attempts: Mutex<std::collections::HashMap<IpAddr, LoginAttempts>>,
 }
 
 impl AdminAuth {
-    pub fn new(admins: Vec<Admin>) -> Self {
+    pub fn new(admins: Vec<Admin>, secure_cookies: bool) -> Self {
         Self {
             admins,
             sessions: Mutex::new(HashSet::new()),
+            secure_cookies,
+            login_attempts: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// Whether the web admin requires a login.
     pub fn required(&self) -> bool {
         !self.admins.is_empty()
+    }
+
+    /// Whether session cookies should carry the `Secure` attribute.
+    pub fn secure_cookies(&self) -> bool {
+        self.secure_cookies
+    }
+
+    /// If `ip` is currently rate-limited, return the seconds the caller should
+    /// wait before retrying; otherwise `None`. Does not mutate counters.
+    pub fn login_retry_after(&self, ip: IpAddr) -> Option<u64> {
+        let attempts = self.login_attempts.lock().unwrap();
+        let a = attempts.get(&ip)?;
+        if a.fails < MAX_LOGIN_FAILS {
+            return None;
+        }
+        let elapsed = a.window_start.elapsed();
+        (elapsed < LOGIN_WINDOW).then(|| (LOGIN_WINDOW - elapsed).as_secs() + 1)
+    }
+
+    /// Record a failed login from `ip`, opening or extending its window.
+    pub fn record_login_failure(&self, ip: IpAddr) {
+        let now = std::time::Instant::now();
+        let mut attempts = self.login_attempts.lock().unwrap();
+        // Drop stale windows so the map stays bounded by active attacker count.
+        attempts.retain(|_, a| now.duration_since(a.window_start) < LOGIN_WINDOW);
+        let entry = attempts.entry(ip).or_insert(LoginAttempts {
+            fails: 0,
+            window_start: now,
+        });
+        if now.duration_since(entry.window_start) >= LOGIN_WINDOW {
+            entry.fails = 0;
+            entry.window_start = now;
+        }
+        entry.fails = entry.fails.saturating_add(1);
+    }
+
+    /// Clear any throttling state for `ip` after a successful login.
+    pub fn record_login_success(&self, ip: IpAddr) {
+        self.login_attempts.lock().unwrap().remove(&ip);
     }
 
     /// Verify a login attempt: credentials must match an admin, and the
@@ -323,6 +447,7 @@ impl Manager {
             server_truststore_password: spec.server_truststore_password,
             mtls_required: spec.mtls_required,
             blocklist: Vec::new(),
+            max_connections: spec.max_connections,
             udp_associate_enabled: spec.udp_associate_enabled,
             udp_allow_private: spec.udp_allow_private,
             udp_bind_addr: spec.udp_bind_addr,
@@ -359,6 +484,7 @@ impl Manager {
             cfg.connect_timeout_secs = spec.connect_timeout_secs;
             cfg.override_headers = spec.override_headers;
             cfg.mtls_required = spec.mtls_required;
+            cfg.max_connections = spec.max_connections;
             cfg.udp_associate_enabled = spec.udp_associate_enabled;
             cfg.udp_allow_private = spec.udp_allow_private;
             cfg.udp_bind_addr = spec.udp_bind_addr;
@@ -733,6 +859,15 @@ impl Manager {
         listener: TcpListener,
         token: CancellationToken,
     ) {
+        // Per-proxy concurrent-connection cap. A semaphore permit is acquired
+        // before spawning each connection task and held for the task's whole
+        // lifetime (handshake + relay), so it also bounds slow-handshake holds.
+        // `None` means unlimited (the operator explicitly set max_connections=0).
+        let (proxy_id, max_conns) = {
+            let cfg = runtime.config.lock().unwrap();
+            (cfg.id.clone(), effective_max_connections(cfg.max_connections))
+        };
+        let sem = max_conns.map(|n| Arc::new(Semaphore::new(n)));
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
@@ -743,10 +878,28 @@ impl Manager {
                             tracing::debug!("rejected blocked peer {peer}");
                             continue;
                         }
+                        // Enforce the connection cap: drop the connection when no
+                        // permit is available rather than queueing it.
+                        let permit = match &sem {
+                            Some(s) => match s.clone().try_acquire_owned() {
+                                Ok(p) => Some(p),
+                                Err(_) => {
+                                    tracing::debug!(
+                                        "proxy {proxy_id} at max_connections; rejected {peer}"
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
                         let m = manager.clone();
                         let rt = runtime.clone();
                         let t = token.clone();
                         tokio::spawn(async move {
+                            // Held for the connection's lifetime; releases the
+                            // permit on drop (when this task ends).
+                            let _permit = permit;
                             let (protocol, keepalive) = {
                                 let cfg = rt.config.lock().unwrap();
                                 (cfg.protocol, cfg.keepalive_secs)
@@ -769,11 +922,19 @@ impl Manager {
                                         .unwrap()
                                         .clone()
                                         .unwrap_or_else(|| m.tls.clone());
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => {
+                                    // Bound the TLS handshake so a client that
+                                    // stalls mid-handshake cannot pin the task.
+                                    match tokio::time::timeout(
+                                        relay::HANDSHAKE_TIMEOUT,
+                                        acceptor.accept(stream),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(tls_stream)) => {
                                             http::serve(m, rt, tls_stream, peer, t).await
                                         }
-                                        Err(e) => Err(anyhow!("TLS handshake failed: {e}")),
+                                        Ok(Err(e)) => Err(anyhow!("TLS handshake failed: {e}")),
+                                        Err(_) => Err(anyhow!("TLS handshake timed out")),
                                     }
                                 }
                                 Protocol::Udp => {
@@ -846,6 +1007,7 @@ impl Manager {
                 udp_advertise_ip: cfg.udp_advertise_ip.clone(),
                 udp_max_datagram: cfg.udp_max_datagram,
                 udp_max_dests: cfg.udp_max_dests,
+                max_connections: cfg.max_connections,
                 blocklist: {
                     let mut bl = cfg.blocklist.clone();
                     bl.sort();
@@ -898,6 +1060,7 @@ mod tests {
             udp_advertise_ip: None,
             udp_max_datagram: None,
             udp_max_dests: None,
+            max_connections: None,
         }
     }
 
@@ -937,11 +1100,14 @@ mod tests {
             .hash_password(b"hunter2", &salt)
             .unwrap()
             .to_string();
-        let auth = AdminAuth::new(vec![Admin {
-            username: "alice".into(),
-            password: hash,
-            network: None,
-        }]);
+        let auth = AdminAuth::new(
+            vec![Admin {
+                username: "alice".into(),
+                password: hash,
+                network: None,
+            }],
+            false,
+        );
         let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         assert!(auth.check("alice", "hunter2", ip).is_ok());
         assert!(auth.check("alice", "nope", ip).is_err());
@@ -964,6 +1130,67 @@ mod tests {
         assert!(udp_spec(Some("1.2.3.4:53")).validate().is_ok());
     }
 
+    #[test]
+    fn validate_rejects_control_chars_and_overlong_name() {
+        let mut s = udp_spec(Some("1.2.3.4:53"));
+        s.name = "ok name".into();
+        assert!(s.validate().is_ok());
+        // CR/LF and other control chars (the XSS break-out helpers) are refused.
+        s.name = "evil\r\nX".into();
+        assert!(s.validate().is_err());
+        s.name = "x".repeat(201);
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn salt_cache_detects_reuse_and_evicts_oldest() {
+        let mut c = SaltCache::new(2);
+        assert!(c.insert(b"a")); // new
+        assert!(!c.insert(b"a")); // replay -> rejected
+        assert!(c.insert(b"b")); // new
+        assert!(c.insert(b"c")); // new -> evicts the oldest ("a")
+        assert!(!c.insert(b"c")); // still remembered
+        assert!(c.insert(b"a")); // "a" was evicted, so it is new again
+    }
+
+    #[test]
+    fn note_ss_salt_rejects_replayed_salt() {
+        let rt = runtime_with_blocklist(Vec::new());
+        assert!(rt.note_ss_salt(b"saltsaltsalt1234"));
+        assert!(!rt.note_ss_salt(b"saltsaltsalt1234"));
+        assert!(rt.note_ss_salt(b"a-different-salt"));
+    }
+
+    #[test]
+    fn login_rate_limit_blocks_after_threshold_and_clears_on_success() {
+        let auth = AdminAuth::new(
+            vec![Admin {
+                username: "u".into(),
+                password: "p".into(),
+                network: None,
+            }],
+            false,
+        );
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(auth.login_retry_after(ip), None);
+        for _ in 0..MAX_LOGIN_FAILS {
+            auth.record_login_failure(ip);
+        }
+        assert!(auth.login_retry_after(ip).is_some());
+        // A different IP is unaffected.
+        let other: std::net::IpAddr = "5.6.7.8".parse().unwrap();
+        assert_eq!(auth.login_retry_after(other), None);
+        // A successful login clears the throttle for that IP.
+        auth.record_login_success(ip);
+        assert_eq!(auth.login_retry_after(ip), None);
+    }
+
+    #[test]
+    fn secure_cookies_flag_is_reported() {
+        assert!(!AdminAuth::new(Vec::new(), false).secure_cookies());
+        assert!(AdminAuth::new(Vec::new(), true).secure_cookies());
+    }
+
     fn temp_manager() -> Arc<Manager> {
         let dir = std::env::temp_dir().join(format!("snproxy-test-{}", Uuid::new_v4()));
         let storage = Storage::open(dir.to_str().unwrap()).unwrap();
@@ -974,7 +1201,7 @@ mod tests {
             proxies: DashMap::new(),
             events,
             resource_events,
-            admin: AdminAuth::new(Vec::new()),
+            admin: AdminAuth::new(Vec::new(), false),
             tls: crate::tls::acceptor(None, None).unwrap(),
             default_connector: crate::tls::plain_connector(),
             blocklist: Mutex::new(HashSet::new()),
@@ -1007,6 +1234,7 @@ mod tests {
             server_truststore_password: None,
             mtls_required: false,
             blocklist: list,
+            max_connections: None,
             udp_associate_enabled: true,
             udp_allow_private: false,
             udp_bind_addr: None,

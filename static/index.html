@@ -404,7 +404,9 @@
           <div><label>Keep-alive (s)</label><input id="fKeepalive" type="number" min="0" placeholder="0" /></div>
           <div><label>Idle timeout (s)</label><input id="fIdle" type="number" min="0" placeholder="0" /></div>
           <div><label>Connect timeout (s)</label><input id="fConnTimeout" type="number" min="0" placeholder="0" /></div>
+          <div><label>Max active connections (0 = unlimited)</label><input id="fMaxConns" type="number" min="0" placeholder="8888" /></div>
         </div>
+        <div class="hint" style="margin-top:4px;">New connections beyond this cap are refused at accept time. Default 8888; set 0 for unlimited.</div>
       </div>
       <div class="err" id="formErr"></div>
     </div>
@@ -495,7 +497,12 @@ function fmtDuration(ms) {
 }
 function fmtTime(ms) { return new Date(ms).toLocaleString(); }
 function esc(s) {
-  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  // Escape every character that can break out of an HTML text node, a quoted
+  // attribute, or a quoted JS string in an inline handler (single/double quote
+  // and backtick), preventing stored XSS via attacker-influenced values.
+  return String(s).replace(/[&<>"'`]/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", "`": "&#96;"
+  }[c]));
 }
 // IP portion of a "host:port" / "[ipv6]:port" address.
 function ipOf(addr) {
@@ -880,6 +887,7 @@ function resetForm() {
   $("fProto").value = "socks5"; $("fCipher").value = "aes-256-gcm";
   $("fUser").value = ""; $("fPass").value = ""; $("fForward").value = "";
   $("fKeepalive").value = ""; $("fIdle").value = ""; $("fConnTimeout").value = "";
+  $("fMaxConns").value = "8888";
   $("hdrList").innerHTML = "";
   $("fClientP12").value = ""; $("fClientP12Pass").value = "";
   $("fClientP12Alias").value = ""; $("fClientP12EntryPass").value = "";
@@ -918,6 +926,8 @@ function editProxy(id) {
   $("fKeepalive").value = p.keepalive_secs || "";
   $("fIdle").value = p.idle_timeout_secs || "";
   $("fConnTimeout").value = p.connect_timeout_secs || "";
+  // null/undefined -> the server default (8888); 0 (unlimited) is preserved.
+  $("fMaxConns").value = p.max_connections ?? 8888;
   (p.override_headers || []).forEach(h => addHeaderRow(h.key, h.value));
   $("fClientP12Alias").value = p.client_p12_alias || "";
   $("fMtls").checked = !!p.mtls_required;
@@ -961,6 +971,9 @@ async function saveForm() {
     udp_bind_addr: null, udp_advertise_ip: null,
     udp_max_datagram: 0, udp_max_dests: 0,
   };
+  // Empty field -> server default (8888); 0 means unlimited; otherwise the cap.
+  const mc = parseInt($("fMaxConns").value);
+  body.max_connections = Number.isFinite(mc) && mc >= 0 ? mc : 8888;
   if (proto === "shadowsocks") {
     body.ss_method = $("fCipher").value;
     body.ss_password = $("fPass").value;

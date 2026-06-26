@@ -53,6 +53,8 @@ pub struct ProxySnapshot {
     pub udp_advertise_ip: Option<String>,
     pub udp_max_datagram: Option<usize>,
     pub udp_max_dests: Option<u32>,
+    /// Cap on concurrent connections (`None` = built-in default, `0` = unlimited).
+    pub max_connections: Option<u32>,
     /// Source addresses blocked on this proxy specifically.
     pub blocklist: Vec<String>,
     pub total_connections: u64,
