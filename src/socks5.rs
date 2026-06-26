@@ -26,10 +26,13 @@ const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_USERPASS: u8 = 0x02;
 const METHOD_REJECT: u8 = 0xFF;
 
-/// One per-destination outbound socket plus its idle bookkeeping.
+/// One per-destination outbound socket plus its idle bookkeeping. `cancel`
+/// fires when the per-destination idle reaper retires this socket, ending its
+/// reply task.
 struct DestEntry {
     sock: Arc<UdpSocket>,
     last_active: StdMutex<Instant>,
+    cancel: CancellationToken,
 }
 
 /// Resolve a `ParsedHost` to a canonical `SocketAddr`, doing NO blocking I/O.
@@ -56,8 +59,14 @@ pub async fn serve(
     peer: SocketAddr,
     token: CancellationToken,
 ) -> Result<()> {
-    negotiate_auth(&mut stream, &runtime).await?;
-    let req = read_request(&mut stream).await?;
+    // Bound the whole pre-relay handshake so a client cannot stall mid-auth /
+    // mid-request and pin the task + fd indefinitely (slow-loris).
+    let req = tokio::time::timeout(relay::HANDSHAKE_TIMEOUT, async {
+        negotiate_auth(&mut stream, &runtime).await?;
+        read_request(&mut stream).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("socks5 handshake timed out"))??;
     match req.cmd {
         CMD_CONNECT => {
             let dst = req.host_port();
@@ -232,7 +241,7 @@ async fn udp_associate(
     token: CancellationToken,
 ) -> Result<()> {
     // 0. Feature gate.
-    let (enabled, bind_cfg, advertise, max_dg, idle, allow_private) = {
+    let (enabled, bind_cfg, advertise, max_dg, idle, allow_private, max_dests) = {
         let cfg = runtime.config.lock().unwrap();
         (
             cfg.udp_associate_enabled,
@@ -241,6 +250,7 @@ async fn udp_associate(
             cfg.udp_max_datagram,
             cfg.idle_timeout_secs,
             cfg.udp_allow_private,
+            cfg.udp_max_dests,
         )
     };
     if !enabled {
@@ -331,6 +341,8 @@ async fn udp_associate(
                 entry.clone(),
                 max_datagram,
                 allow_private,
+                max_dests,
+                idle,
             );
             // Control-stream EOF read: one non-looped arm over a NON-zero buffer.
             let mut ctrl_buf = [0u8; 1];
@@ -350,6 +362,7 @@ async fn udp_associate(
 /// outbound-socket map and the DNS cache, pins the client on the first accepted
 /// datagram, canonicalizes the destination once, filters it, and forwards via
 /// an atomic-claimed per-dest socket.
+#[allow(clippy::too_many_arguments)]
 async fn udp_relay_loop(
     manager: Arc<Manager>,
     runtime: Arc<ProxyRuntime>,
@@ -358,6 +371,8 @@ async fn udp_relay_loop(
     entry: Arc<ConnEntry>,
     max_datagram: usize,
     allow_private: bool,
+    max_dests: Option<u32>,
+    idle_secs: Option<u64>,
 ) {
     // recv buffer holds DATA + worst-case domain header (7 + 255 = 262).
     let mut buf = vec![0u8; max_datagram + 262];
@@ -367,10 +382,30 @@ async fn udp_relay_loop(
     const DNS_TTL: Duration = Duration::from_secs(30);
     let mut pinned: Option<SocketAddr> = None;
 
+    // Per-destination idle reaper: retire outbound sockets + reply tasks that
+    // have seen no traffic for the idle bound (the same default the plain UDP
+    // forwarder uses), so one association cannot pin sockets/tasks indefinitely.
+    let (dest_idle, reaper_interval) = crate::udp::idle_bounds(idle_secs);
+    let mut reaper = tokio::time::interval(reaper_interval);
+    reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
-        let (n, from) = match relay_sock.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(_) => return, // unrecoverable relay-socket error
+        let (n, from) = tokio::select! {
+            _ = reaper.tick() => {
+                let now = Instant::now();
+                for d in dests.iter() {
+                    let idle_for = now.duration_since(*d.value().last_active.lock().unwrap());
+                    if idle_for >= dest_idle {
+                        // Cancel; the reply task is the sole owner of removal.
+                        d.value().cancel.cancel();
+                    }
+                }
+                continue;
+            }
+            r = relay_sock.recv_from(&mut buf) => match r {
+                Ok(v) => v,
+                Err(_) => return, // unrecoverable relay-socket error
+            },
         };
         // Pin: first datagram must come from the control peer IP; thereafter
         // accept only the exact pinned 2-tuple. All else dropped silently.
@@ -400,7 +435,7 @@ async fn udp_relay_loop(
                 };
                 forward_one(
                     &manager, &runtime, &relay_sock, &entry, &dests,
-                    pinned.unwrap(), canon, data, allow_private,
+                    pinned.unwrap(), canon, data, allow_private, max_dests,
                 )
                 .await;
             }
@@ -415,12 +450,19 @@ async fn udp_relay_loop(
                 if let Some(canon) = cached {
                     forward_one(
                         &manager, &runtime, &relay_sock, &entry, &dests,
-                        pinned.unwrap(), canon, data, allow_private,
+                        pinned.unwrap(), canon, data, allow_private, max_dests,
                     )
                     .await;
                     continue;
                 }
                 // Cache miss / TTL expiry: resolve OFF the recv loop (B3).
+                // Honour the destination cap before spawning a resolver so a
+                // flood of unique names cannot spawn unbounded lookup tasks.
+                if let Some(cap) = max_dests
+                    && dests.len() >= cap as usize
+                {
+                    continue;
+                }
                 let (m, rt, rs, en, ds, dc) = (
                     manager.clone(), runtime.clone(), relay_sock.clone(),
                     entry.clone(), dests.clone(), dns_cache.clone(),
@@ -437,7 +479,7 @@ async fn udp_relay_loop(
                     let Some(addr) = addrs.next() else { return };
                     let canon = SocketAddr::new(Manager::canonicalize_ip(addr.ip()), port);
                     dc.insert(name, (canon, Instant::now()));
-                    forward_one(&m, &rt, &rs, &en, &ds, client, canon, data, allow_private).await;
+                    forward_one(&m, &rt, &rs, &en, &ds, client, canon, data, allow_private, max_dests).await;
                 });
             }
         }
@@ -456,6 +498,7 @@ async fn forward_one(
     canon: SocketAddr,
     data: Vec<u8>,
     allow_private: bool,
+    max_dests: Option<u32>,
 ) {
     // Destination security filter on the CANONICAL address (B2/C1).
     if manager.dest_blocked(runtime, canon.ip(), canon.port()) {
@@ -469,6 +512,14 @@ async fn forward_one(
     let dest = match dests.entry(canon) {
         dashmap::mapref::entry::Entry::Occupied(o) => o.get().clone(),
         dashmap::mapref::entry::Entry::Vacant(v) => {
+            // Enforce the per-association destination cap: drop datagrams to new
+            // destinations once the live socket count reaches the configured
+            // limit (operator-facing `udp_max_dests`).
+            if let Some(cap) = max_dests
+                && dests.len() >= cap as usize
+            {
+                return;
+            }
             let bind: SocketAddr = if canon.is_ipv4() {
                 (Ipv4Addr::UNSPECIFIED, 0).into()
             } else {
@@ -485,8 +536,9 @@ async fn forward_one(
             let de = Arc::new(DestEntry {
                 sock: sock.clone(),
                 last_active: StdMutex::new(Instant::now()),
+                cancel: CancellationToken::new(),
             });
-            spawn_reply_task(relay_sock.clone(), sock, entry.clone(), client, dests.clone(), canon);
+            spawn_reply_task(relay_sock.clone(), de.clone(), entry.clone(), client, dests.clone(), canon);
             v.insert(de.clone());
             de
         }
@@ -499,11 +551,12 @@ async fn forward_one(
 
 /// Reply task: relay `dest`'s answers back to the pinned client. Loops `recv`
 /// on the connected outbound socket, frames each reply with the responder's
-/// literal IP, sends it to the pinned client, accounts payload-only, and
-/// removes itself from `dests` on exit.
+/// literal IP, sends it to the pinned client, accounts payload-only, refreshes
+/// the destination's `last_active`, and removes itself from `dests` on exit
+/// (association teardown, per-destination idle reap, or a socket error).
 fn spawn_reply_task(
     relay_sock: Arc<UdpSocket>,
-    dest_sock: Arc<UdpSocket>,
+    dest: Arc<DestEntry>,
     entry: Arc<ConnEntry>,
     client: SocketAddr,
     dests: Arc<DashMap<SocketAddr, Arc<DestEntry>>>,
@@ -514,8 +567,9 @@ fn spawn_reply_task(
         let mut buf = vec![0u8; 64 * 1024 + 22];
         loop {
             let n = tokio::select! {
-                _ = entry.cancel.cancelled() => break,
-                r = dest_sock.recv(&mut buf) => match r {
+                _ = entry.cancel.cancelled() => break, // association teardown
+                _ = dest.cancel.cancelled() => break,  // per-dest idle reap
+                r = dest.sock.recv(&mut buf) => match r {
                     Ok(n) => n,
                     Err(_) => break, // outbound socket error
                 },
@@ -527,6 +581,7 @@ fn spawn_reply_task(
             if relay_sock.send_to(&out, client).await.is_err() {
                 break;
             }
+            *dest.last_active.lock().unwrap() = Instant::now();
             entry.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
         }
         dests.remove(&canon);

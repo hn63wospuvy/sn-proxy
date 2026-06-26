@@ -253,26 +253,38 @@ pub async fn serve(
     let key_len = method.key_size();
     let master = evp_bytes_to_key(&password, key_len);
 
-    // The client opens with its salt, then the AEAD chunk stream.
-    let mut salt = vec![0u8; key_len];
-    stream.read_exact(&mut salt).await?;
-    let mut dec = Decryptor::new(Cipher::new(method, &subkey(&master, &salt, key_len)));
+    // The client opens with its salt, then the AEAD chunk stream. Bound the
+    // whole handshake with a timeout (slow-loris) and reject a reused client
+    // salt: re-deriving the same subkey while the AEAD nonce restarts at zero
+    // would reuse a (key, nonce) pair — catastrophic for GCM/ChaCha20-Poly1305 —
+    // and also enables straightforward traffic replay (M3).
+    let (mut dec, dst, initial) = tokio::time::timeout(relay::HANDSHAKE_TIMEOUT, async {
+        let mut salt = vec![0u8; key_len];
+        stream.read_exact(&mut salt).await?;
+        if !runtime.note_ss_salt(&salt) {
+            bail!("shadowsocks salt reuse detected (possible replay)");
+        }
+        let mut dec = Decryptor::new(Cipher::new(method, &subkey(&master, &salt, key_len)));
 
-    // Decrypt chunks until the target address is complete.
-    let mut plain: Vec<u8> = Vec::new();
-    let (dst, consumed) = loop {
-        if let Some(found) = parse_addr(&plain) {
-            break found;
-        }
-        match dec.read_chunk(&mut stream).await? {
-            Some(chunk) => plain.extend_from_slice(&chunk),
-            None => bail!("client closed before sending the shadowsocks address"),
-        }
-        if plain.len() > 8192 {
-            bail!("shadowsocks address header too long");
-        }
-    };
-    let initial: Vec<u8> = plain.split_off(consumed);
+        // Decrypt chunks until the target address is complete.
+        let mut plain: Vec<u8> = Vec::new();
+        let (dst, consumed) = loop {
+            if let Some(found) = parse_addr(&plain) {
+                break found;
+            }
+            match dec.read_chunk(&mut stream).await? {
+                Some(chunk) => plain.extend_from_slice(&chunk),
+                None => bail!("client closed before sending the shadowsocks address"),
+            }
+            if plain.len() > 8192 {
+                bail!("shadowsocks address header too long");
+            }
+        };
+        let initial: Vec<u8> = plain.split_off(consumed);
+        Ok::<(Decryptor, String, Vec<u8>), anyhow::Error>((dec, dst, initial))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("shadowsocks handshake timed out"))??;
 
     let target = match relay::connect(&dst, connect_timeout, keepalive).await {
         Ok(t) => t,

@@ -40,25 +40,30 @@ pub async fn serve(
     peer: SocketAddr,
     token: CancellationToken,
 ) -> Result<()> {
-    // Read the HTTP upgrade request head.
+    // Read the HTTP upgrade request head. Bounded by a handshake timeout so a
+    // client cannot stall mid-head and pin the task.
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
-    let head_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
+    let head_end = tokio::time::timeout(relay::HANDSHAKE_TIMEOUT, async {
+        loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break Ok::<usize, anyhow::Error>(pos);
+            }
+            if buf.len() > MAX_HEADER {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")
+                    .await;
+                bail!("request header too large");
+            }
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                bail!("client closed before sending a request");
+            }
+            buf.extend_from_slice(&tmp[..n]);
         }
-        if buf.len() > MAX_HEADER {
-            let _ = stream
-                .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")
-                .await;
-            bail!("request header too large");
-        }
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            bail!("client closed before sending a request");
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    };
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("websocket handshake read timed out"))??;
 
     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
     let mut lines = head.split("\r\n");

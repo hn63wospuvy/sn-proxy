@@ -60,6 +60,8 @@ CONFIG FILE KEYS (all optional):
   admin_network    Restrict that admin's login to a CIDR, e.g. 192.168.1.0/24
   admin.<NAME>.password   Extra admin account (multi-admin form)
   admin.<NAME>.network    That admin's allowed CIDR (optional)
+  admin_https      true if the admin is served over HTTPS (marks the session
+                   cookie Secure); default false
   mode             daemon (background, default) or foreground
   log_file         Daily-rotated log file (dir or path); off when unset
 
@@ -105,6 +107,9 @@ struct AppConfig {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     admins: Vec<Admin>,
+    /// Whether the web admin is served over HTTPS (e.g. behind a TLS-terminating
+    /// reverse proxy). When true the session cookie is marked `Secure`.
+    admin_https: bool,
     /// Daemon (background) or foreground. Defaults to daemon.
     mode: RunMode,
     /// `log_file` config value (trimmed, non-empty) — daily-rotated file
@@ -183,6 +188,15 @@ fn parse_properties(path: &str) -> Result<HashMap<String, String>> {
         }
     }
     Ok(map)
+}
+
+/// Parse a boolean config value. Accepts `true`/`1`/`yes`/`on` (case-insensitive,
+/// trimmed) as true; everything else is false.
+fn parse_bool(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
 }
 
 /// Parse a CIDR network range from a config value.
@@ -286,6 +300,7 @@ fn resolve_config() -> Result<(Command, AppConfig)> {
     let mut tls_cert = None;
     let mut tls_key = None;
     let mut admins = Vec::new();
+    let mut admin_https = false;
     let mut mode = RunMode::Daemon;
     let mut log_file = None;
 
@@ -301,6 +316,7 @@ fn resolve_config() -> Result<(Command, AppConfig)> {
         tls_cert = props.get("tls_cert").cloned();
         tls_key = props.get("tls_key").cloned();
         admins = build_admins(&props)?;
+        admin_https = props.get("admin_https").is_some_and(|v| parse_bool(v));
         if let Some(m) = props.get("mode") {
             mode = RunMode::parse(m).unwrap_or_else(|e| {
                 eprintln!("error: config mode: {e}");
@@ -336,6 +352,7 @@ fn resolve_config() -> Result<(Command, AppConfig)> {
             tls_cert,
             tls_key,
             admins,
+            admin_https,
             mode,
             log_file,
         },
@@ -497,12 +514,20 @@ async fn main() -> Result<()> {
     let default_connector = tls::plain_connector();
     let admin_count = config.admins.len();
     let plaintext = plaintext_admin_count(&config.admins);
-    let admin = AdminAuth::new(config.admins);
+    let admin_https = config.admin_https;
+    let admin = AdminAuth::new(config.admins, admin_https);
     if admin.required() {
         tracing::info!("web admin login is ENABLED ({admin_count} admin account(s))");
         if plaintext > 0 {
             tracing::warn!(
                 "{plaintext} admin password(s) are stored in plaintext — prefer $argon2 hashes"
+            );
+        }
+        if !admin_https {
+            tracing::warn!(
+                "web admin auth is enabled but admin_https is not set — the session cookie is \
+                 sent in cleartext over HTTP; serve the admin behind HTTPS and set \
+                 admin_https=true so the cookie is marked Secure"
             );
         }
     } else {

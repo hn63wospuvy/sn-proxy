@@ -17,6 +17,13 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Maximum time a client may take to complete a protocol handshake (SOCKS5
+/// negotiation, HTTP/WebSocket request head, Shadowsocks salt + address header,
+/// or the HTTPS listener's TLS handshake) before the connection is dropped.
+/// Bounds slow-loris-style holds on the pre-relay phase, which the per-relay
+/// idle watchdog does not cover (it only arms once relaying starts).
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Apply a TCP keep-alive interval to a socket (no-op when `secs` is 0/`None`).
 pub fn apply_keepalive(stream: &TcpStream, secs: Option<u64>) {
     if let Some(s) = secs.filter(|s| *s > 0) {
@@ -343,6 +350,7 @@ mod tests {
             server_truststore_password: None,
             mtls_required: false,
             blocklist: Vec::new(),
+            max_connections: None,
             udp_associate_enabled: true,
             udp_allow_private: false,
             udp_bind_addr: None,

@@ -57,6 +57,21 @@ pub struct HeaderOverride {
     pub value: String,
 }
 
+/// Default cap on concurrent connections per proxy when `max_connections` is
+/// unset. A deliberately high ceiling (the project favours permissive defaults
+/// with a backstop over a tight limit that breaks legitimate load).
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 8888;
+
+/// Resolve a `max_connections` config value into an effective cap:
+/// `None` -> the built-in default, `Some(0)` -> unlimited, `Some(n)` -> `n`.
+pub fn effective_max_connections(max: Option<u32>) -> Option<usize> {
+    match max {
+        None => Some(DEFAULT_MAX_CONNECTIONS as usize),
+        Some(0) => None,
+        Some(n) => Some(n as usize),
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -142,6 +157,13 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub blocklist: Vec<String>,
 
+    /// Maximum number of concurrent connections this proxy accepts. `None`
+    /// (configs written before the field existed) means the built-in default
+    /// (`DEFAULT_MAX_CONNECTIONS`); `Some(0)` means unlimited; `Some(n)` caps
+    /// at `n`. Enforced in the TCP accept loop.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+
     // --- SOCKS5 UDP ASSOCIATE (Protocol::Socks5 only) ---
     /// Gate CMD=0x03 UDP ASSOCIATE; when false the server replies `0x07`.
     #[serde(default = "default_true")]
@@ -209,5 +231,17 @@ mod tests {
         assert_eq!(cfg.udp_advertise_ip, None);
         assert_eq!(cfg.udp_max_datagram, None);
         assert_eq!(cfg.udp_max_dests, None);
+        assert_eq!(cfg.max_connections, None);
+    }
+
+    #[test]
+    fn effective_max_connections_semantics() {
+        // unset -> default, explicit 0 -> unlimited, explicit n -> n.
+        assert_eq!(
+            effective_max_connections(None),
+            Some(DEFAULT_MAX_CONNECTIONS as usize)
+        );
+        assert_eq!(effective_max_connections(Some(0)), None);
+        assert_eq!(effective_max_connections(Some(100)), Some(100));
     }
 }
