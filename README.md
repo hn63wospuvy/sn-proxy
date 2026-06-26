@@ -51,6 +51,13 @@ web admin:
   open connections per proxy with source IP, destination and bytes
   sent/received
 - **Connection history** of closed connections, persisted in **RocksDB**
+- **Host resource monitor** — a toggled side panel with realtime CPU, RAM, file
+  descriptor/handle and network-throughput charts plus a per-interface ifstat
+  table. Demand-driven: a single collector samples the host once a second only
+  while at least one viewer is watching, and fans the sample out to all of them.
+  Linux reads `/proc`; Windows uses Win32 (`GetSystemTimes`,
+  `GlobalMemoryStatusEx`, `GetPerformanceInfo`, `GetIfTable2`); other platforms
+  show "unsupported"
 - **HTTP API** built on **axum**
 
 ## Running
@@ -188,6 +195,7 @@ curl -x https://127.0.0.1:1082 --proxy-insecure https://example.com
 | `POST   /api/blocklist`              | Block an address (`{"addr": …}`)  |
 | `DELETE /api/blocklist`              | Unblock an address (`{"addr": …}`) |
 | `GET    /ws`                         | Websocket monitoring feed         |
+| `GET    /ws/resources`               | Websocket host-resource feed (demand-driven) |
 
 ## Architecture
 

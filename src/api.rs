@@ -37,6 +37,7 @@ pub fn router(manager: Arc<Manager>) -> Router {
             get(list_blocklist).post(add_block).delete(remove_block),
         )
         .route("/ws", get(ws_handler))
+        .route("/ws/resources", get(ws_resources_handler))
         .route_layer(middleware::from_fn_with_state(manager.clone(), require_auth));
 
     Router::new()
@@ -401,6 +402,22 @@ async fn ws_handler(State(m): State<Arc<Manager>>, ws: IncomingUpgrade) -> impl 
     tokio::spawn(async move {
         if let Err(e) = ws::handle(fut, m).await {
             tracing::debug!("websocket closed: {e}");
+        }
+    });
+    response
+}
+
+/// Upgrade the request to a websocket and stream host-resource samples. The
+/// subscription drives the demand-driven collector (it only reads `/proc` while
+/// this socket is open).
+async fn ws_resources_handler(
+    State(m): State<Arc<Manager>>,
+    ws: IncomingUpgrade,
+) -> impl IntoResponse {
+    let (response, fut) = ws.upgrade().unwrap();
+    tokio::spawn(async move {
+        if let Err(e) = ws::handle_resources(fut, m).await {
+            tracing::debug!("resource websocket closed: {e}");
         }
     });
     response

@@ -3,6 +3,7 @@
 
 use crate::model::{BasicAuth, HeaderOverride, Protocol, ProxyConfig};
 use crate::monitor::{ActiveConn, MonitorEvent, ProxySnapshot};
+use crate::resources::ResourceSample;
 use crate::storage::Storage;
 use crate::{http, relay, shadowsocks, socks5, tcp, tls, ws_proxy};
 use anyhow::{Result, anyhow, bail};
@@ -236,6 +237,9 @@ pub struct Manager {
     pub storage: Arc<Storage>,
     pub proxies: DashMap<String, Arc<ProxyRuntime>>,
     pub events: broadcast::Sender<MonitorEvent>,
+    /// Host-resource samples for the realtime monitor. Demand-driven: the
+    /// collector only reads `/proc` while this channel has subscribers.
+    pub resource_events: broadcast::Sender<ResourceSample>,
     /// Web-admin authentication.
     pub admin: AdminAuth,
     /// Global TLS acceptor for `https` proxies without their own keystore.
@@ -256,11 +260,15 @@ impl Manager {
         default_connector: TlsConnector,
     ) -> Result<Arc<Self>> {
         let (events, _) = broadcast::channel(256);
+        // Small buffer: monitor clients only need the latest sample, and a
+        // lagged receiver is ignored (resyncs on the next tick).
+        let (resource_events, _) = broadcast::channel(16);
         let blocklist = storage.load_blocklist().unwrap_or_default();
         let manager = Arc::new(Self {
             storage: storage.clone(),
             proxies: DashMap::new(),
             events,
+            resource_events,
             admin,
             tls,
             default_connector,
@@ -960,10 +968,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snproxy-test-{}", Uuid::new_v4()));
         let storage = Storage::open(dir.to_str().unwrap()).unwrap();
         let (events, _) = broadcast::channel(16);
+        let (resource_events, _) = broadcast::channel(16);
         Arc::new(Manager {
             storage,
             proxies: DashMap::new(),
             events,
+            resource_events,
             admin: AdminAuth::new(Vec::new()),
             tls: crate::tls::acceptor(None, None).unwrap(),
             default_connector: crate::tls::plain_connector(),

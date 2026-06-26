@@ -11,6 +11,7 @@ mod manager;
 mod model;
 mod monitor;
 mod relay;
+mod resources;
 mod shadowsocks;
 mod socks5;
 mod storage;
@@ -499,6 +500,26 @@ async fn main() -> Result<()> {
                     proxies: manager.snapshot(),
                 };
                 let _ = manager.events.send(event);
+            }
+        });
+    }
+
+    // Host resource sampler for the realtime monitor. Demand-driven: collect_tick
+    // only reads /proc while at least one viewer is subscribed; otherwise it is a
+    // no-op and resets the sampler baseline on the falling edge to zero viewers.
+    {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let mut sampler = resources::new_sampler();
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            // Skip (don't burst) missed ticks: after a runtime stall, bursting
+            // would divide accumulated byte deltas by the assumed 1 s dt and
+            // produce bogus rate spikes.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut active = false;
+            loop {
+                tick.tick().await;
+                resources::collect_tick(&mut *sampler, &manager.resource_events, &mut active);
             }
         });
     }
