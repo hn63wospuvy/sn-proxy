@@ -5,10 +5,10 @@
 /data_mtls
 /data_smoke
 *.log
-# generated test PKI material (mtls_test/gen_certs.py recreates it)
-mtls_test/*.crt
-mtls_test/*.key
-mtls_test/*.p12
+# generated test PKI material (tests/mtls/gen_certs.py recreates it)
+tests/mtls/*.crt
+tests/mtls/*.key
+tests/mtls/*.p12
 # local config may hold admin_password — keep only the example committed
 /config.properties
 *.pem

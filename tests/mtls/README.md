@@ -22,16 +22,16 @@ Generated `*.crt` / `*.key` / `*.p12` files are git-ignored.
 
 ```sh
 # 1. generate the test PKI
-python mtls_test/gen_certs.py
+python tests/mtls/gen_certs.py
 
 # 2. start the mTLS destination server (leave running)
-python mtls_test/mtls_server.py
+python tests/mtls/mtls_server.py
 
 # 3. start sn-proxy on the admin port the test expects
 target/debug/sn-proxy -p 127.0.0.1:8088 -d data_mtls
 
 # 4. run the test
-python mtls_test/test_mtls.py
+python tests/mtls/test_mtls.py
 ```
 
 `test_mtls.py` exits 0 when all checks pass.
