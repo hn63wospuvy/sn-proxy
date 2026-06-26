@@ -134,11 +134,19 @@ python -c "from argon2 import PasswordHasher as P; print(P().hash('your-password
 `mode` (or `-m` / `--mode`) selects how the process runs. It defaults to
 **`daemon`**: on startup the process re-spawns itself detached from the console,
 prints `started in background, pid <N>` (also written to
-`<data_dir>/sn-proxy.pid`) and the foreground command returns immediately. Stop
-it with the OS using that pid (`taskkill /PID <N>` on Windows, `kill <N>` on
-Unix). Before backgrounding, the parent does a pre-flight bind of the web-admin
-port, so a port-in-use error is reported on the console instead of vanishing
-into the background.
+`<data_dir>/sn-proxy.pid`) and the foreground command returns immediately. Before
+backgrounding, the parent does a pre-flight bind of the web-admin port, so a
+port-in-use error is reported on the console instead of vanishing into the
+background.
+
+Stop every running background instance with **`sn-proxy stop`**. It matches
+processes by executable name (so it also catches orphans from earlier runs that
+the single-entry pidfile no longer tracks), skips the stop command's own
+process, force-terminates the rest, and removes `<data_dir>/sn-proxy.pid`. Pass
+the same `-d`/`--data-dir` (or `-c`) you started with so the right pidfile is
+cleaned; the kill itself works regardless of pidfile state. To stop a single
+instance instead, use the OS with its pid (`taskkill /PID <N>` on Windows,
+`kill <N>` on Unix).
 
 Use `mode=foreground` (or `--mode foreground`) to stay attached — the process
 runs in the current console and logs to stdout, which is what you usually want

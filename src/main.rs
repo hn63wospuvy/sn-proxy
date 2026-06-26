@@ -14,6 +14,7 @@ mod relay;
 mod resources;
 mod shadowsocks;
 mod socks5;
+mod stop;
 mod storage;
 mod tcp;
 mod tls;
@@ -39,7 +40,8 @@ const HELP: &str = "\
 sn-proxy — multi-instance, multi-protocol proxy server with a web admin
 
 USAGE:
-  sn-proxy [OPTIONS]
+  sn-proxy [OPTIONS]          Start the server (daemon by default)
+  sn-proxy stop [OPTIONS]     Kill every running sn-proxy background process
 
 OPTIONS:
   -c, --config <FILE>          Properties config file (key=value)
@@ -62,7 +64,18 @@ CONFIG FILE KEYS (all optional):
   log_file         Daily-rotated log file (dir or path); off when unset
 
 Command-line -p / -d / -m override the config file.
-Defaults: 0.0.0.0:8080, data/, mode daemon.";
+Defaults: 0.0.0.0:8080, data/, mode daemon.
+
+`stop` reads -d/--data-dir (or the config's data_dir) only to clean up the
+pidfile; it terminates processes by matching the executable name, so it works
+even when the pidfile is stale or missing.";
+
+/// Which subcommand to run: start the server (default) or stop running ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Run,
+    Stop,
+}
 
 /// How the process runs: backgrounded (default) or attached to the console.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,8 +253,10 @@ fn require_value(flag: &str, value: Option<String>) -> String {
     })
 }
 
-/// Resolve config from defaults, then the config file, then CLI flags.
-fn resolve_config() -> Result<AppConfig> {
+/// Resolve config from defaults, then the config file, then CLI flags. Also
+/// returns the requested subcommand (`stop` as a bare argument, else `Run`).
+fn resolve_config() -> Result<(Command, AppConfig)> {
+    let mut command = Command::Run;
     let mut config_path: Option<String> = None;
     let mut cli_port: Option<String> = None;
     let mut cli_data_dir: Option<String> = None;
@@ -258,6 +273,7 @@ fn resolve_config() -> Result<AppConfig> {
                 println!("{HELP}");
                 std::process::exit(0);
             }
+            "stop" => command = Command::Stop,
             other => {
                 eprintln!("error: unknown argument: {other}\n\n{HELP}");
                 std::process::exit(2);
@@ -312,15 +328,18 @@ fn resolve_config() -> Result<AppConfig> {
         });
     }
 
-    Ok(AppConfig {
-        listen,
-        data_dir,
-        tls_cert,
-        tls_key,
-        admins,
-        mode,
-        log_file,
-    })
+    Ok((
+        command,
+        AppConfig {
+            listen,
+            data_dir,
+            tls_cert,
+            tls_key,
+            admins,
+            mode,
+            log_file,
+        },
+    ))
 }
 
 /// Re-spawn the process detached from the console and exit the parent.
@@ -449,7 +468,13 @@ fn init_logging(config: &AppConfig, foreground: bool) -> Result<Option<WorkerGua
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = resolve_config()?;
+    let (command, config) = resolve_config()?;
+
+    // `stop` kills running daemons by process name and exits — handled before
+    // any daemonize / RocksDB / bind work, none of which it needs.
+    if command == Command::Stop {
+        stop::run(&config.data_dir);
+    }
 
     // Daemonize before opening RocksDB or binding the port. The child carries
     // the marker and skips this branch; the parent re-spawns and exits.
