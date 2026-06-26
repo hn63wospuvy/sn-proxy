@@ -112,6 +112,52 @@
     border-top: 1px solid var(--border); font-family: ui-monospace, monospace;
     font-size: 13px;
   }
+  /* docs modal: tabs + content */
+  .info-ic {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px; margin-left: 6px; border-radius: 50%;
+    border: 1px solid var(--border); color: var(--muted); font-size: 11px;
+    font-style: normal; font-weight: 700; cursor: pointer; user-select: none;
+    vertical-align: middle; transition: .12s;
+  }
+  .info-ic:hover { border-color: var(--accent); color: var(--accent); }
+  .tabs {
+    display: flex; flex-wrap: wrap; gap: 4px; padding: 12px 20px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    font: inherit; font-size: 12px; cursor: pointer; border: 1px solid transparent;
+    border-bottom: none; background: none; color: var(--muted);
+    padding: 7px 12px; border-radius: 6px 6px 0 0; transition: .12s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--text); background: var(--panel2);
+    border-color: var(--border); margin-bottom: -1px;
+  }
+  .modal-body.doc { display: block; }
+  .doc h3 { font-size: 15px; margin-bottom: 4px; }
+  .doc .lead { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  .doc h4 {
+    font-size: 11px; color: var(--accent); text-transform: uppercase;
+    letter-spacing: .05em; margin: 16px 0 7px;
+  }
+  .doc p { font-size: 13px; margin-bottom: 8px; }
+  .doc ul { margin: 0 0 8px 18px; }
+  .doc li { font-size: 13px; margin-bottom: 5px; }
+  .doc code {
+    font-family: ui-monospace, monospace; font-size: 12px;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 5px;
+  }
+  .doc .field { color: var(--text); font-weight: 600; }
+  .doc .note {
+    border-left: 3px solid; padding: 8px 12px; border-radius: 0 6px 6px 0;
+    margin: 4px 0 10px; font-size: 12.5px;
+  }
+  .doc .note.warn { border-color: var(--warn); background: rgba(210,153,34,.08); }
+  .doc .note.bad  { border-color: var(--bad);  background: rgba(248,81,73,.08); }
+  .doc .note.ok   { border-color: var(--ok);   background: rgba(46,160,67,.08); }
 </style>
 </head>
 <body>
@@ -120,6 +166,7 @@
   <span class="ws-status"><span class="dot" id="wsDot"></span><span id="wsText">connecting…</span></span>
   <div class="spacer"></div>
   <button id="logoutBtn" style="display:none" onclick="logout()">Logout</button>
+  <button onclick="openDocs()">Docs</button>
   <button onclick="openBlock()">Blocklist</button>
   <button class="primary" onclick="openForm()">+ New Proxy</button>
 </header>
@@ -147,7 +194,8 @@
     <div class="modal-body">
       <div><label>Name</label><input id="fName" placeholder="My proxy" /></div>
       <div>
-        <label>Protocol</label>
+        <label>Protocol<i class="info-ic" title="Protocol guide &amp; security practices"
+          onclick="openDocs($('fProto').value)">i</i></label>
         <select id="fProto" onchange="onProtoChange()">
           <option value="socks5">SOCKS5</option>
           <option value="http">HTTP</option>
@@ -308,6 +356,18 @@
     </div>
     <div class="modal-foot">
       <button onclick="closeBlock()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- docs modal -->
+<div class="modal-bg" id="docsModal">
+  <div class="modal" style="width: 720px;">
+    <h2>Protocol guide &amp; security practices</h2>
+    <div class="tabs" id="docsTabs"></div>
+    <div class="modal-body doc" id="docsBody"></div>
+    <div class="modal-foot">
+      <button onclick="closeDocs()">Close</button>
     </div>
   </div>
 </div>
@@ -806,8 +866,270 @@ async function removeBlock(addr) {
   refresh();
 }
 
+// ---- protocol documentation ----
+// Tab order; the leading "overview" tab is general, the rest map 1:1 to the
+// values of the #fProto <select> so the form's info icon can deep-link to one.
+const DOC_TABS = [
+  { key: "overview",     label: "Overview" },
+  { key: "socks5",       label: "SOCKS5" },
+  { key: "http",         label: "HTTP" },
+  { key: "https",        label: "HTTPS" },
+  { key: "shadowsocks",  label: "Shadowsocks" },
+  { key: "tcp",          label: "TCP" },
+  { key: "udp",          label: "UDP" },
+  { key: "websocket",    label: "WebSocket" },
+];
+
+const DOCS = {
+  overview: `
+    <h3>How sn·proxy works</h3>
+    <p class="lead">Each proxy is one listener bound to a <code>host:port</code> that speaks a single
+       protocol. Pick the tab for the protocol you are configuring; this page covers the settings
+       shared by all of them.</p>
+
+    <h4>Listen address</h4>
+    <ul>
+      <li><span class="field">Bind to a specific interface.</span> <code>127.0.0.1:1080</code> is reachable
+        only from the local host; <code>0.0.0.0:1080</code> exposes the proxy on <em>every</em> interface.</li>
+      <li>A public bind address turns the box into an open relay unless authentication and/or a
+        firewall restrict who can reach it.</li>
+    </ul>
+    <div class="note warn">Only bind to <code>0.0.0.0</code> when the port is protected by auth and a
+      firewall. Prefer the narrowest interface that still works.</div>
+
+    <h4>Authentication</h4>
+    <p>SOCKS5, HTTP, HTTPS and WebSocket support username/password auth — leave the username blank to
+      disable it. TCP and UDP forwarders have no auth layer; Shadowsocks authenticates with its
+      pre-shared password. Where credentials travel in cleartext (SOCKS5, HTTP, WebSocket without TLS)
+      they can be sniffed on the wire.</p>
+
+    <h4>Encryption on the wire</h4>
+    <ul>
+      <li><span class="field">Encrypted:</span> HTTPS, Shadowsocks (AEAD), and WebSocket fronted by TLS (wss).</li>
+      <li><span class="field">Cleartext:</span> SOCKS5, HTTP, TCP, UDP and plain WebSocket — anyone on the
+        path sees the payload and any credentials. Tunnel these over a VPN or an SSH/TLS layer when they
+        cross untrusted networks.</li>
+    </ul>
+
+    <h4>Blocklist</h4>
+    <p>Source addresses (<code>IP</code> or <code>IP:port</code>) can be refused globally or per-proxy.
+      Blocks apply at accept time and also drop matching live connections immediately. Use the
+      <span class="field">Block IP</span> action on a live connection for a one-click ban.</p>
+
+    <h4>Timeouts (Advanced, 0 = off)</h4>
+    <ul>
+      <li><span class="field">Keep-alive</span> — TCP keep-alive probe interval; detects dead peers.</li>
+      <li><span class="field">Idle timeout</span> — closes a connection after this many seconds with no
+        traffic; bounds resource use from abandoned sessions.</li>
+      <li><span class="field">Connect timeout</span> — caps how long dialing the destination may take.</li>
+    </ul>
+    <div class="note ok">Set an idle timeout on internet-facing proxies so stalled or abandoned
+      connections cannot pile up.</div>`,
+
+  socks5: `
+    <h3>SOCKS5 <span class="hint">· RFC 1928 / 1929</span></h3>
+    <p class="lead">A general-purpose proxy: the client asks the proxy to reach any
+      <code>host:port</code> via <code>CONNECT</code>, with optional UDP relaying.</p>
+
+    <h4>Configuration</h4>
+    <ul>
+      <li><span class="field">Listen address</span> — where the proxy binds.</li>
+      <li><span class="field">Username / password</span> — optional RFC 1929 auth. Blank username = no
+        auth (open proxy).</li>
+    </ul>
+
+    <h4>UDP ASSOCIATE</h4>
+    <p>Enables <code>CMD=0x03</code>, which spins up a UDP relay socket so clients can send/receive
+      datagrams (DNS, QUIC, game traffic). When disabled the server answers <code>0x07</code>
+      (command not supported).</p>
+    <ul>
+      <li><span class="field">Allow internal/private destinations</span> — when off, datagrams to
+        loopback, RFC 1918 and link-local/metadata ranges are refused.</li>
+      <li><span class="field">Relay bind address</span> — interface the relay socket listens on
+        (defaults to the listener IP).</li>
+      <li><span class="field">Advertised IP (BND.ADDR)</span> — the address returned to the client; set
+        this when the proxy is behind NAT so the client targets the public IP.</li>
+      <li><span class="field">Max datagram / max destinations</span> — caps per-datagram size and the
+        number of distinct peers per association.</li>
+    </ul>
+    <div class="note bad">"Allow internal/private destinations" is an <strong>SSRF risk</strong>: it lets a
+      client reach <code>127.0.0.1</code>, internal services and cloud metadata endpoints
+      (<code>169.254.169.254</code>). Keep it off unless you fully trust every client.</div>
+    <div class="note warn">A wildcard relay bind (<code>0.0.0.0</code>/<code>::</code>) with no advertised
+      IP leaves <code>BND.ADDR</code> ambiguous behind NAT — set an advertised IP.</div>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>Always set username/password when the listener is reachable off-host.</li>
+      <li>Leave private UDP destinations disabled; cap max destinations to bound relay fan-out.</li>
+      <li>SOCKS5 is cleartext — tunnel it over a VPN/SSH if it crosses an untrusted network.</li>
+    </ul>`,
+
+  http: `
+    <h3>HTTP proxy</h3>
+    <p class="lead">Handles <code>CONNECT</code> tunnelling (HTTPS and any TCP) plus plain HTTP request
+      forwarding. The hop between client and proxy is unencrypted.</p>
+
+    <h4>Configuration</h4>
+    <ul>
+      <li><span class="field">Username / password</span> — optional HTTP Basic auth; a missing/invalid
+        credential gets <code>407 Proxy Authentication Required</code>.</li>
+      <li><span class="field">Override request headers</span> — inject or replace headers on
+        plain-forwarded HTTP requests (an override replaces any header of the same name). Not applied to
+        <code>CONNECT</code> tunnels, whose bytes are opaque.</li>
+      <li><span class="field">Client certificate (mTLS to destination)</span> — present a PKCS#12 client
+        identity to upstream servers that require mutual TLS.</li>
+    </ul>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>Basic credentials are Base64, not encrypted. On untrusted networks use the <span class="field">HTTPS</span>
+        variant so the client-to-proxy hop is wrapped in TLS.</li>
+      <li>Enable auth before exposing the listener, or it is an open forward proxy.</li>
+      <li>Store the client <code>.p12</code> password carefully — it unlocks an identity trusted by upstreams.</li>
+    </ul>
+    <div class="note warn">Plain HTTP proxying sends credentials and forwarded request data in
+      cleartext. Prefer HTTPS whenever the path is not fully trusted.</div>`,
+
+  https: `
+    <h3>HTTPS proxy <span class="hint">· HTTP proxy over TLS</span></h3>
+    <p class="lead">The HTTP proxy with its listener wrapped in TLS, so the client-to-proxy hop —
+      including Basic credentials — is encrypted.</p>
+
+    <h4>Configuration</h4>
+    <ul>
+      <li><span class="field">Listener certificate (PKCS#12)</span> — the server cert + key. When left
+        empty the proxy falls back to the global certificate (a self-signed cert generated at startup if
+        no PEM files are configured).</li>
+      <li><span class="field">Require client certificates (mTLS)</span> — only clients presenting a cert
+        accepted by the truststore may connect.</li>
+      <li><span class="field">Truststore (PKCS#12)</span> — the CA certificates used to validate client
+        certs when mTLS is on.</li>
+      <li>Header overrides and upstream client-mTLS work exactly as in the HTTP tab.</li>
+    </ul>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>Replace the self-signed fallback with a certificate your clients trust to avoid TLS warnings
+        and MITM ambiguity.</li>
+      <li>Enable mTLS for strong client authentication — it ties access to certificates instead of a
+        shared password.</li>
+      <li>Combine listener TLS with username/password for layered auth.</li>
+    </ul>
+    <div class="note ok">HTTPS + mTLS is the strongest listener configuration here: the hop is encrypted
+      and every client is cryptographically identified.</div>`,
+
+  shadowsocks: `
+    <h3>Shadowsocks <span class="hint">· AEAD (SIP004)</span></h3>
+    <p class="lead">An encrypted proxy keyed by a shared password. Traffic is split into authenticated
+      AEAD chunks, making it hard to fingerprint or tamper with.</p>
+
+    <h4>Configuration</h4>
+    <ul>
+      <li><span class="field">Cipher</span> — <code>aes-256-gcm</code>, <code>aes-128-gcm</code> or
+        <code>chacha20-ietf-poly1305</code>. The key/salt size follows the cipher.</li>
+      <li><span class="field">Password (required)</span> — the master key is derived from it
+        (EVP_BytesToKey), then a per-connection HKDF-SHA1 subkey is used. There is no username.</li>
+    </ul>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>Use a long, random password — it is the <em>only</em> secret protecting the proxy.</li>
+      <li>Prefer <code>aes-256-gcm</code>, or <code>chacha20-ietf-poly1305</code> on devices without AES
+        hardware acceleration (typically mobile/ARM).</li>
+      <li>Share the cipher + password over a secure channel; anyone with both has full access.</li>
+    </ul>
+    <div class="note ok">Unlike SOCKS5/HTTP, the wire is encrypted and authenticated end-to-end with the
+      client — no extra TLS layer is needed for confidentiality.</div>`,
+
+  tcp: `
+    <h3>TCP forwarder</h3>
+    <p class="lead">Every accepted connection is piped, unchanged, to one fixed
+      <code>host:port</code>. There is no protocol negotiation, auth or framing — a transparent relay.</p>
+
+    <h4>Configuration</h4>
+    <ul>
+      <li><span class="field">Forward to</span> — the single <code>host:port</code> every connection is
+        relayed to.</li>
+      <li>Timeouts apply as elsewhere; there is no auth layer.</li>
+    </ul>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>Access is governed only by the bind address, the blocklist and your firewall — restrict who can
+        reach the listener.</li>
+      <li>Forward only to destinations you control; the relay carries whatever bytes the client sends.</li>
+      <li>The relay does not add encryption — wrap it in TLS/VPN if the payload is sensitive.</li>
+    </ul>
+    <div class="note warn">No authentication exists for raw TCP forwarding. Anyone who can reach the
+      listener reaches the destination.</div>`,
+
+  udp: `
+    <h3>UDP forwarder</h3>
+    <p class="lead">Relays UDP datagrams to one fixed <code>host:port</code>. Connectionless and
+      stateless beyond per-source tracking — there is no handshake, auth or framing.</p>
+
+    <h4>Configuration</h4>
+    <ul>
+      <li><span class="field">Forward to</span> — the destination every datagram is relayed to.</li>
+      <li>Idle timeout reclaims per-source relay state for sources that go quiet.</li>
+    </ul>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>UDP source addresses are trivially spoofable — never rely on them for trust decisions.</li>
+      <li>Restrict reach with the bind address, blocklist and firewall; there is no auth.</li>
+      <li>Forward only to trusted destinations and watch for amplification if it faces the internet.</li>
+    </ul>
+    <div class="note warn">For SOCKS5-mediated UDP with per-destination control and SSRF guards, use a
+      SOCKS5 proxy with UDP ASSOCIATE instead of a raw UDP forwarder.</div>`,
+
+  websocket: `
+    <h3>WebSocket tunnel</h3>
+    <p class="lead">Tunnels a connection to a fixed <code>host:port</code> inside a WebSocket upgrade,
+      so the traffic looks like ordinary HTTP(S) and can traverse WebSocket-aware proxies and CDNs.</p>
+
+    <h4>Configuration</h4>
+    <ul>
+      <li><span class="field">Forward to</span> — the destination the tunnel carries traffic to.</li>
+      <li><span class="field">Username / password</span> — optional Basic auth checked on the upgrade
+        request (<code>Authorization</code> / <code>Proxy-Authorization</code>); failure returns
+        <code>401</code>.</li>
+    </ul>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>The listener speaks plaintext <code>ws://</code>. For confidentiality terminate TLS in front of
+        it (a reverse proxy / load balancer) so clients connect over <code>wss://</code>.</li>
+      <li>Enable Basic auth, and remember it is only protected once the hop is TLS-wrapped.</li>
+      <li>Forward only to destinations you control.</li>
+    </ul>
+    <div class="note warn">Plain <code>ws://</code> is cleartext like HTTP. Front it with TLS (wss) before
+      exposing it to untrusted networks.</div>`,
+};
+
+let docTab = "overview";
+function renderDocTabs() {
+  $("docsTabs").innerHTML = DOC_TABS.map(t =>
+    `<button class="tab${t.key === docTab ? " active" : ""}"
+      onclick="selectDocTab('${t.key}')">${t.label}</button>`).join("");
+  $("docsBody").innerHTML = DOCS[docTab] || "";
+  $("docsBody").scrollTop = 0;
+}
+function selectDocTab(key) {
+  docTab = DOCS[key] ? key : "overview";
+  renderDocTabs();
+}
+// Opens the docs modal. Pass a protocol value (e.g. from #fProto) to deep-link
+// straight to that tab; omit it to land on the overview.
+function openDocs(proto) {
+  selectDocTab(proto && DOCS[proto] ? proto : "overview");
+  $("docsModal").classList.add("show");
+}
+function closeDocs() { $("docsModal").classList.remove("show"); }
+
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") { closeForm(); closeHist(); closeBlock(); }
+  if (e.key === "Escape") { closeForm(); closeHist(); closeBlock(); closeDocs(); }
 });
 
 // ---- login / session ----
