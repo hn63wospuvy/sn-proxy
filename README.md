@@ -52,6 +52,14 @@ web admin:
   [`fastwebsockets`](https://github.com/denoland/fastwebsockets)): live list of
   open connections per proxy with source IP, destination and bytes
   sent/received
+- **PROXY protocol v1** on the TCP forwarder (`send_proxy_protocol`, off by
+  default) — announces the original client address to the destination. Without
+  it the destination only ever sees this proxy's address, which silently breaks
+  everything that reasons about the client IP: SPF checks on a relayed SMTP
+  port, IP allow/deny lists, per-client rate limits, access logs. The header is
+  written as the **first bytes** of the upstream connection, so the destination
+  must be configured to expect it from this proxy's address — turning it on
+  against a server that does not parse it drops every connection
 - **Connection history** of closed connections, persisted in **RocksDB**
 - **Host resource monitor** — a toggled side panel with realtime CPU, RAM, file
   descriptor/handle and network-throughput charts plus a per-interface ifstat

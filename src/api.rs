@@ -183,6 +183,8 @@ struct ProxyForm {
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
     connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    send_proxy_protocol: bool,
     // Client mTLS toward the destination (HTTP/HTTPS). The PKCS#12 fields are
     // tri-state: omitted = keep, "" = clear, base64 = replace.
     #[serde(default)]
@@ -238,6 +240,7 @@ impl ProxyForm {
             keepalive_secs: nonzero(self.keepalive_secs),
             idle_timeout_secs: nonzero(self.idle_timeout_secs),
             connect_timeout_secs: nonzero(self.connect_timeout_secs),
+            send_proxy_protocol: self.send_proxy_protocol,
             client_p12: self.client_p12,
             client_p12_password: blank(self.client_p12_password),
             client_p12_alias: blank(self.client_p12_alias),
