@@ -139,6 +139,8 @@ pub struct ProxySpec {
     pub keepalive_secs: Option<u64>,
     pub idle_timeout_secs: Option<u64>,
     pub connect_timeout_secs: Option<u64>,
+    /// Announce the client address to the destination (TCP forwarder only).
+    pub send_proxy_protocol: bool,
     pub client_p12: Option<String>,
     pub client_p12_password: Option<String>,
     pub client_p12_alias: Option<String>,
@@ -436,6 +438,7 @@ impl Manager {
             keepalive_secs: spec.keepalive_secs,
             idle_timeout_secs: spec.idle_timeout_secs,
             connect_timeout_secs: spec.connect_timeout_secs,
+            send_proxy_protocol: spec.send_proxy_protocol,
             client_p12: nonempty(spec.client_p12),
             client_p12_password: spec.client_p12_password,
             client_p12_alias: spec.client_p12_alias,
@@ -485,6 +488,7 @@ impl Manager {
             cfg.override_headers = spec.override_headers;
             cfg.mtls_required = spec.mtls_required;
             cfg.max_connections = spec.max_connections;
+            cfg.send_proxy_protocol = spec.send_proxy_protocol;
             cfg.udp_associate_enabled = spec.udp_associate_enabled;
             cfg.udp_allow_private = spec.udp_allow_private;
             cfg.udp_bind_addr = spec.udp_bind_addr;
@@ -995,6 +999,7 @@ impl Manager {
                 keepalive_secs: cfg.keepalive_secs,
                 idle_timeout_secs: cfg.idle_timeout_secs,
                 connect_timeout_secs: cfg.connect_timeout_secs,
+                send_proxy_protocol: cfg.send_proxy_protocol,
                 override_headers: cfg.override_headers.clone(),
                 has_client_p12: cfg.client_p12.is_some(),
                 client_p12_alias: cfg.client_p12_alias.clone(),
@@ -1040,6 +1045,7 @@ mod tests {
             auth: None,
             ss_method: None,
             ss_password: None,
+            send_proxy_protocol: false,
             forward_to: forward_to.map(|s| s.to_string()),
             keepalive_secs: None,
             idle_timeout_secs: None,
@@ -1219,6 +1225,7 @@ mod tests {
             auth: None,
             ss_method: None,
             ss_password: None,
+            send_proxy_protocol: false,
             forward_to: cfg.forward_to.take(),
             keepalive_secs: None,
             idle_timeout_secs: None,

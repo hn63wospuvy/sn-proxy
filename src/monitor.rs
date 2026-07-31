@@ -33,6 +33,8 @@ pub struct ProxySnapshot {
     pub keepalive_secs: Option<u64>,
     pub idle_timeout_secs: Option<u64>,
     pub connect_timeout_secs: Option<u64>,
+    /// Whether the TCP forwarder prepends a PROXY protocol v1 header.
+    pub send_proxy_protocol: bool,
     /// HTTP request-header overrides (HTTP/HTTPS only).
     pub override_headers: Vec<HeaderOverride>,
     /// Whether a client mTLS PKCS#12 identity is configured.

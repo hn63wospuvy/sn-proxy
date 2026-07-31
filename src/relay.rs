@@ -335,6 +335,7 @@ mod tests {
             auth: None,
             ss_method: None,
             ss_password: None,
+            send_proxy_protocol: false,
             forward_to: Some("1.2.3.4:53".into()),
             keepalive_secs: None,
             idle_timeout_secs: None,

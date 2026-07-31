@@ -114,6 +114,16 @@ pub struct ProxyConfig {
     /// Timeout in seconds when dialing the destination (`None`/0 = off).
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+    /// Announce the original client address to the destination with a PROXY
+    /// protocol v1 header (TCP forwarder only).
+    ///
+    /// Off by default, and it has to stay that way: the header is written as
+    /// the first bytes of the upstream connection, so a destination that does
+    /// not expect it sees garbage instead of the protocol it speaks and drops
+    /// the session. Only enable it once the destination is configured to trust
+    /// this proxy's address.
+    #[serde(default)]
+    pub send_proxy_protocol: bool,
 
     // --- HTTP/HTTPS: client-side mutual TLS toward the destination ---
     /// PKCS#12 client identity (base64-encoded `.p12` bytes) presented to
@@ -232,6 +242,15 @@ mod tests {
         assert_eq!(cfg.udp_max_datagram, None);
         assert_eq!(cfg.udp_max_dests, None);
         assert_eq!(cfg.max_connections, None);
+    }
+
+    #[test]
+    fn old_config_defaults_proxy_protocol_off() {
+        // Enabling it on an upgrade would prepend a header the destination
+        // never agreed to parse, breaking every existing TCP forwarder.
+        let json = r#"{"id":"x","name":"n","listen_addr":"0.0.0.0:1080"}"#;
+        let cfg: ProxyConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.send_proxy_protocol);
     }
 
     #[test]

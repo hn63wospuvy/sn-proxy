@@ -316,6 +316,17 @@
         <input id="fForward" placeholder="10.0.0.5:5432" />
         <div class="hint">every connection is forwarded to this host:port</div>
       </div>
+      <!-- tcp only: announce the client address to the destination -->
+      <div id="rowProxyProto" style="display:none;">
+        <label><input id="fProxyProto" type="checkbox" /> Send PROXY protocol v1 header</label>
+        <div class="hint">
+          Tells the destination who the real client is — without it the destination only ever
+          sees this proxy's address, which breaks SPF checks, IP allow lists and rate limits.
+          <b>The destination must be configured to expect it</b>: the header is the first thing
+          written on the upstream connection, so turning this on against a server that does not
+          parse it drops every connection.
+        </div>
+      </div>
       <!-- username/password auth: socks5, http, https, websocket -->
       <div id="rowUser">
         <label>Username (optional — leave blank to disable auth)</label>
@@ -553,6 +564,7 @@ function render(proxies) {
         ${p.protocol === "https" && p.mtls_required ? `<span class="badge auth">mTLS</span>` : ""}
         ${p.protocol === "socks5" && p.udp_associate_enabled ? `<span class="badge auth">UDP</span>` : ""}
         ${p.protocol === "socks5" && p.udp_allow_private ? `<span class="badge auth" style="background:#a33;">UDP-PRIV</span>` : ""}
+        ${p.protocol === "tcp" && p.send_proxy_protocol ? `<span class="badge auth">PROXY-PROTO</span>` : ""}
         ${httpish && p.override_headers && p.override_headers.length
           ? `<span class="badge auth">${p.override_headers.length} HDR</span>` : ""}
         <div class="spacer"></div>
@@ -798,6 +810,9 @@ function onProtoChange() {
   $("rowUser").style.display = (ss || tcp || udp) ? "none" : "";
   $("rowCipher").style.display = ss ? "" : "none";
   $("rowForward").style.display = (tcp || ws || udp) ? "" : "none";
+  // TCP only: the header is written raw on the upstream socket, which has no
+  // meaning inside a WebSocket tunnel and none at all over UDP.
+  $("rowProxyProto").style.display = tcp ? "" : "none";
   $("rowPass").style.display = (tcp || udp) ? "none" : "";
   $("secHttp").style.display = http ? "" : "none";
   $("secServerTls").style.display = (proto === "https") ? "" : "none";
@@ -888,6 +903,7 @@ function resetForm() {
   $("fUser").value = ""; $("fPass").value = ""; $("fForward").value = "";
   $("fKeepalive").value = ""; $("fIdle").value = ""; $("fConnTimeout").value = "";
   $("fMaxConns").value = "8888";
+  $("fProxyProto").checked = false;
   $("hdrList").innerHTML = "";
   $("fClientP12").value = ""; $("fClientP12Pass").value = "";
   $("fClientP12Alias").value = ""; $("fClientP12EntryPass").value = "";
@@ -928,6 +944,7 @@ function editProxy(id) {
   $("fConnTimeout").value = p.connect_timeout_secs || "";
   // null/undefined -> the server default (8888); 0 (unlimited) is preserved.
   $("fMaxConns").value = p.max_connections ?? 8888;
+  $("fProxyProto").checked = !!p.send_proxy_protocol;
   (p.override_headers || []).forEach(h => addHeaderRow(h.key, h.value));
   $("fClientP12Alias").value = p.client_p12_alias || "";
   $("fMtls").checked = !!p.mtls_required;
@@ -970,6 +987,7 @@ async function saveForm() {
     udp_associate_enabled: true, udp_allow_private: false,
     udp_bind_addr: null, udp_advertise_ip: null,
     udp_max_datagram: 0, udp_max_dests: 0,
+    send_proxy_protocol: false,
   };
   // Empty field -> server default (8888); 0 means unlimited; otherwise the cap.
   const mc = parseInt($("fMaxConns").value);
@@ -979,6 +997,7 @@ async function saveForm() {
     body.ss_password = $("fPass").value;
   } else if (proto === "tcp" || proto === "udp") {
     body.forward_to = $("fForward").value.trim();
+    if (proto === "tcp") body.send_proxy_protocol = $("fProxyProto").checked;
   } else {
     const user = $("fUser").value.trim();
     if (user) body.auth = { username: user, password: $("fPass").value };
