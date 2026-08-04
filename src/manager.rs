@@ -187,6 +187,50 @@ impl ProxySpec {
         {
             bail!("this proxy needs a forward destination (host:port)");
         }
+        if self.protocol == Protocol::Turn {
+            // An empty realm is not cosmetic: libwebrtc only recomputes its
+            // credential hash when the realm CHANGES and initialises it to "",
+            // so a 401 carrying an empty realm leaves the hash empty and every
+            // MESSAGE-INTEGRITY afterwards is computed over an empty key.
+            if !crate::turn_auth::realm_is_valid(&self.turn.realm) {
+                bail!(
+                    "turn needs a realm: 1-127 printable ASCII characters, no space, quote or \
+                     backslash (an empty realm makes browsers fail every allocation)"
+                );
+            }
+            // HMAC accepts a zero-length key without complaint, so an unset
+            // secret would authenticate everyone rather than no one.
+            let secret = self.turn.static_secret.as_deref().unwrap_or("");
+            if secret.len() < crate::turn_auth::MIN_SECRET_LEN {
+                bail!(
+                    "turn needs a static_secret of at least {} bytes — the REST API is the only \
+                     auth path, so a short or empty secret is an open relay",
+                    crate::turn_auth::MIN_SECRET_LEN
+                );
+            }
+            if self.turn.transports.is_empty() {
+                bail!("turn needs at least one transport (udp, tcp or tls)");
+            }
+            if let Some(bad) = self
+                .turn
+                .transports
+                .iter()
+                .find(|t| !matches!(t.as_str(), "udp" | "tcp" | "tls"))
+            {
+                // Without this an unknown value would be silently ignored and
+                // the operator would think they had enabled something.
+                bail!("unknown turn transport {bad:?} (expected udp, tcp or tls)");
+            }
+            if self.turn.has("tls")
+                && self.turn.tls_listen.as_deref().unwrap_or("").is_empty()
+            {
+                bail!("the turn tls transport needs its own listen address (turns: port)");
+            }
+            let (min, max) = self.turn.effective_port_range();
+            if min > max {
+                bail!("turn relay port range is inverted ({min} > {max})");
+            }
+        }
         if self.protocol == Protocol::Shadowsocks {
             let method = self.ss_method.as_deref().unwrap_or("");
             if !matches!(
@@ -451,7 +495,11 @@ impl Manager {
             server_p12_password: spec.server_p12_password,
             server_truststore_p12: nonempty(spec.server_truststore_p12),
             server_truststore_password: spec.server_truststore_password,
-            mtls_required: spec.mtls_required,
+            // turns: clients never present a client certificate, and
+            // acceptor_from_p12 hard-fails on mtls without a truststore — which
+            // would make start() fail with an opaque error rather than an
+            // obviously wrong setting.
+            mtls_required: spec.mtls_required && spec.protocol != Protocol::Turn,
             blocklist: Vec::new(),
             max_connections: spec.max_connections,
             udp_associate_enabled: spec.udp_associate_enabled,
@@ -490,7 +538,7 @@ impl Manager {
             cfg.idle_timeout_secs = spec.idle_timeout_secs;
             cfg.connect_timeout_secs = spec.connect_timeout_secs;
             cfg.override_headers = spec.override_headers;
-            cfg.mtls_required = spec.mtls_required;
+            cfg.mtls_required = spec.mtls_required && spec.protocol != Protocol::Turn;
             cfg.max_connections = spec.max_connections;
             cfg.send_proxy_protocol = spec.send_proxy_protocol;
             cfg.udp_associate_enabled = spec.udp_associate_enabled;
@@ -565,13 +613,19 @@ impl Manager {
         let cfg = runtime.config.lock().unwrap().clone();
 
         let acceptor = match (cfg.protocol, cfg.server_p12.as_deref()) {
-            (Protocol::Https, Some(p12)) if !p12.is_empty() => Some(tls::acceptor_from_p12(
-                p12,
-                cfg.server_p12_password.as_deref().unwrap_or(""),
-                cfg.server_truststore_p12.as_deref(),
-                cfg.server_truststore_password.as_deref().unwrap_or(""),
-                cfg.mtls_required,
-            )?),
+            // TURN's `turns:` listener uses the same keystore mechanism as an
+            // HTTPS listener. The `_ => None` fallthrough below would otherwise
+            // silently discard a stored keystore, so the gate has to widen here
+            // rather than be handled at the call site.
+            (Protocol::Https | Protocol::Turn, Some(p12)) if !p12.is_empty() => {
+                Some(tls::acceptor_from_p12(
+                    p12,
+                    cfg.server_p12_password.as_deref().unwrap_or(""),
+                    cfg.server_truststore_p12.as_deref(),
+                    cfg.server_truststore_password.as_deref().unwrap_or(""),
+                    cfg.mtls_required,
+                )?)
+            }
             _ => None,
         };
         *runtime.https_acceptor.lock().unwrap() = acceptor;
@@ -604,6 +658,133 @@ impl Manager {
         };
 
         let token = CancellationToken::new();
+
+        if protocol == Protocol::Turn {
+            let turn = runtime.config.lock().unwrap().turn.clone();
+
+            // Building the server first also re-checks the secret and the relay
+            // IP before anything is bound, so a misconfigured proxy fails with a
+            // clear error instead of half-starting.
+            let server = crate::turn::Server::new(self.clone(), runtime.clone())?;
+
+            // Bind EVERYTHING before touching proxy state: every `?` below must
+            // leave the proxy exactly as it was, or a partial bind marks it
+            // running with one port live and the Start button then fails with
+            // EADDRINUSE on the others.
+            let udp = if turn.has("udp") {
+                Some(Arc::new(UdpSocket::bind(&addr).await.map_err(|e| {
+                    anyhow!("cannot bind {addr} (turn/udp): {e}")
+                })?))
+            } else {
+                None
+            };
+            let tcp = if turn.has("tcp") {
+                Some(
+                    TcpListener::bind(&addr)
+                        .await
+                        .map_err(|e| anyhow!("cannot bind {addr} (turn/tcp): {e}"))?,
+                )
+            } else {
+                None
+            };
+            let tls_listener = if turn.has("tls") {
+                let a = turn
+                    .tls_listen
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("the turn tls transport needs a listen address"))?;
+                let acceptor = runtime
+                    .https_acceptor
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| self.tls.clone());
+                if runtime.config.lock().unwrap().server_p12.is_none() {
+                    tracing::warn!(
+                        "proxy {id}: the turns: listener has no PKCS#12 keystore, so it will \
+                         present the global self-signed sn-proxy.local certificate — browsers \
+                         validate turns: against the URL hostname and will reject it"
+                    );
+                }
+                Some((
+                    TcpListener::bind(&a)
+                        .await
+                        .map_err(|e| anyhow!("cannot bind {a} (turn/tls): {e}"))?,
+                    acceptor,
+                ))
+            } else {
+                None
+            };
+            if udp.is_none() && tcp.is_none() && tls_listener.is_none() {
+                bail!("select at least one TURN transport");
+            }
+            if turn.has("udp") && !turn.has("tcp") && !turn.has("tls") {
+                tracing::warn!(
+                    "proxy {id}: turn is UDP-only. Send indications and ChannelData carry no \
+                     MESSAGE-INTEGRITY, so on UDP the 5-tuple is the only thing authenticating \
+                     the relay datapath; turns:/TCP is the transport that resists spoofing"
+                );
+            }
+            if turn.allow_private {
+                tracing::warn!(
+                    "proxy {id}: turn allow_private is on — peers may reach loopback, RFC1918 \
+                     and link-local addresses through this relay (UNSAFE on a public server)"
+                );
+            }
+
+            // Commit once, exactly as the other two branches do.
+            *runtime.cancel.lock().unwrap() = Some(token.clone());
+            runtime.running.store(true, Ordering::SeqCst);
+            {
+                let mut cfg = runtime.config.lock().unwrap();
+                cfg.enabled = true;
+                self.storage.save_config(&cfg)?;
+            }
+
+            let mut handles = Vec::new();
+            if let Some(s) = udp {
+                handles.push(tokio::spawn(crate::turn::serve_udp(
+                    server.clone(),
+                    s,
+                    token.clone(),
+                )));
+            }
+            if let Some(l) = tcp {
+                handles.push(tokio::spawn(crate::turn::serve_stream(
+                    server.clone(),
+                    l,
+                    token.clone(),
+                    None,
+                )));
+            }
+            if let Some((l, acc)) = tls_listener {
+                handles.push(tokio::spawn(crate::turn::serve_stream(
+                    server.clone(),
+                    l,
+                    token.clone(),
+                    Some(acc),
+                )));
+            }
+            handles.push(tokio::spawn(crate::turn::reap(
+                server.clone(),
+                token.clone(),
+            )));
+
+            // The supervisor is the SOLE writer of `running`. If each listener
+            // cleared it, the first one to exit would mark the whole proxy
+            // stopped while the other ports were still bound — and start()'s
+            // early-return guard would then not fire, so the operator's next
+            // Start would re-bind and fail with EADDRINUSE.
+            let rt = runtime.clone();
+            tokio::spawn(async move {
+                for h in handles {
+                    let _ = h.await;
+                }
+                rt.running.store(false, Ordering::SeqCst);
+            });
+            tracing::info!("proxy {id} listening on {addr} (turn)");
+            return Ok(());
+        }
 
         if protocol == Protocol::Udp {
             let socket = UdpSocket::bind(&addr)
@@ -1152,6 +1333,129 @@ mod tests {
         // string).
         assert!(!verify_password("$argon2id$broken", "anything"));
         assert!(!verify_password("$argon2id$broken", "$argon2id$broken"));
+    }
+
+    fn turn_spec() -> ProxySpec {
+        let mut s = udp_spec(None);
+        s.protocol = Protocol::Turn;
+        s.forward_to = None; // TURN has no fixed destination
+        s.turn = TurnConfig {
+            realm: "example.org".into(),
+            static_secret: Some("0123456789abcdef".into()),
+            relay_ip: Some("127.0.0.1".into()),
+            ..TurnConfig::default()
+        };
+        s
+    }
+
+    #[test]
+    fn turn_does_not_require_forward_to() {
+        // The forward_to requirement covers Tcp | Websocket | Udp only.
+        assert!(turn_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn turn_requires_a_realm_and_a_long_enough_secret() {
+        let mut s = turn_spec();
+        s.turn.realm = String::new();
+        assert!(s.validate().is_err(), "an empty realm breaks libwebrtc outright");
+        let mut s = turn_spec();
+        s.turn.realm = "has space".into();
+        assert!(s.validate().is_err());
+        let mut s = turn_spec();
+        s.turn.realm = "x".repeat(128);
+        assert!(s.validate().is_err());
+
+        let mut s = turn_spec();
+        s.turn.static_secret = None;
+        assert!(s.validate().is_err(), "no secret is an open relay, not a closed one");
+        let mut s = turn_spec();
+        s.turn.static_secret = Some("short".into());
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn turn_transport_selection_is_validated() {
+        let mut s = turn_spec();
+        s.turn.transports = vec![];
+        assert!(s.validate().is_err());
+        let mut s = turn_spec();
+        s.turn.transports = vec!["quic".into()];
+        assert!(
+            s.validate().is_err(),
+            "an unknown transport would otherwise be silently ignored"
+        );
+        let mut s = turn_spec();
+        s.turn.transports = vec!["tls".into()];
+        assert!(s.validate().is_err(), "tls without a tls_listen address");
+        let mut s = turn_spec();
+        s.turn.transports = vec!["tls".into()];
+        s.turn.tls_listen = Some("0.0.0.0:5349".into());
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn turn_forces_mtls_off_and_checks_the_port_range() {
+        // acceptor_from_p12 hard-fails on mtls without a truststore, which
+        // would make start() fail with an opaque error. turns: clients never
+        // present a client certificate anyway.
+        let m = temp_manager();
+        let mut s = turn_spec();
+        s.mtls_required = true;
+        let cfg = m.create(s).unwrap();
+        assert!(!cfg.mtls_required);
+
+        let mut s = turn_spec();
+        s.turn.relay_min_port = Some(60000);
+        s.turn.relay_max_port = Some(50000);
+        assert!(s.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn start_turn_binds_udp_and_tcp_on_the_same_port() {
+        let m = temp_manager();
+        let mut spec = turn_spec();
+        spec.listen_addr = "127.0.0.1:47820".into();
+        spec.turn.relay_min_port = Some(51500);
+        spec.turn.relay_max_port = Some(51509);
+        let cfg = m.create(spec).unwrap();
+        m.start(&cfg.id).await.unwrap();
+        assert!(std::net::UdpSocket::bind("127.0.0.1:47820").is_err());
+        assert!(std::net::TcpListener::bind("127.0.0.1:47820").is_err());
+        m.stop(&cfg.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_turn_leaves_state_untouched_when_a_bind_fails() {
+        // Bind everything BEFORE committing, so a partial bind cannot leave the
+        // proxy marked running with one port live and the rest dead.
+        let m = temp_manager();
+        let held = std::net::TcpListener::bind("127.0.0.1:47821").unwrap();
+        let mut spec = turn_spec();
+        spec.listen_addr = "127.0.0.1:47821".into();
+        spec.turn.relay_min_port = Some(51510);
+        spec.turn.relay_max_port = Some(51519);
+        let cfg = m.create(spec).unwrap();
+        assert!(m.start(&cfg.id).await.is_err());
+        let rt = m.proxies.get(&cfg.id).unwrap().clone();
+        assert!(!rt.running.load(Ordering::SeqCst));
+        assert!(rt.cancel.lock().unwrap().is_none());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn start_turn_refuses_a_wildcard_relay_without_an_explicit_ip() {
+        // A wildcard-bound relay silently breaks ICE nomination on multi-homed
+        // hosts, and the failure looks like healthy bidirectional traffic.
+        let m = temp_manager();
+        let mut spec = turn_spec();
+        spec.listen_addr = "0.0.0.0:47822".into();
+        spec.turn.relay_ip = None;
+        let cfg = m.create(spec).unwrap();
+        let err = m.start(&cfg.id).await.unwrap_err().to_string();
+        assert!(err.contains("relay_ip"), "unexpected error: {err}");
+        // Nothing was bound, so the port is still free.
+        assert!(std::net::UdpSocket::bind("0.0.0.0:47822").is_ok());
     }
 
     #[test]

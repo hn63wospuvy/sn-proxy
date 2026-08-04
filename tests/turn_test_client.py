@@ -471,8 +471,10 @@ def scenario_relay(host, transport_cls, secret, echo_port, allow_private):
         c.close()
 
 
-def scenario_channel_padding(host, secret, echo_port):
+def scenario_channel_padding(host, secret, echo_port, allow_private):
     """(d) 1-, 2- and 3-byte payloads must each occupy exactly 8 bytes."""
+    if not allow_private:
+        return  # needs a loopback peer permission, which strict mode refuses
     c = TurnClient(TcpTransport(host, TURN_PORT), secret)
     try:
         c.allocate()
@@ -595,14 +597,21 @@ def scenario_channel_keepalive(host, secret, echo_port):
 
 
 def scenario_aiortc(host, secret):
-    """(c) aiortc verifies MESSAGE-INTEGRITY on responses; Chrome does not."""
+    """(c) An independent client that VERIFIES MESSAGE-INTEGRITY on responses.
+
+    This is the canary for the whole response-signing requirement. libwebrtc
+    never checks the integrity of a TURN response, so a server that forgets to
+    sign passes every Chrome test and then fails against Firefox and aiortc.
+    aioice (which aiortc uses) parses every response with the integrity key and
+    raises on a missing or mismatched tag, so it fails loudly where Chrome would
+    not notice at all.
+    """
     try:
-        import aiortc  # noqa: F401
+        from aioice.turn import create_turn_endpoint
     except ImportError:
         print("  SKIP  aiortc canary (pip install aiortc to enable)")
         return
     import asyncio
-    from aiortc.turn import create_turn_endpoint
 
     username, password, _ = credentials(secret)
 
@@ -614,9 +623,15 @@ def scenario_aiortc(host, secret):
             password=password,
             lifetime=600,
         )
-        transport.close()
+        # Reaching here means Allocate, and its MESSAGE-INTEGRITY, verified.
+        relayed = transport.get_extra_info("sockname")
+        assert relayed, "no relayed transport address was reported"
+        # close() is a coroutine in some aioice releases and plain in others.
+        maybe = transport.close()
+        if asyncio.iscoroutine(maybe):
+            await maybe
 
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(), timeout=20))
 
 
 # --------------------------------------------------------------------------
@@ -669,7 +684,7 @@ def main():
         check("relay over tcp", lambda: scenario_relay(
             args.host, TcpTransport, SECRET, echo_port, args.allow_private))
         check("channel data padding over tcp", lambda: scenario_channel_padding(
-            args.host, SECRET, echo_port))
+            args.host, SECRET, echo_port, args.allow_private))
         check("allocate retransmit vs duplicate", lambda: scenario_allocate_retransmit(
             args.host, SECRET))
         check("refresh(0) echoes zero", lambda: scenario_refresh_zero(args.host, SECRET))

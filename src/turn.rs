@@ -19,9 +19,10 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_rustls::TlsAcceptor;
 
 /// REQUESTED-TRANSPORT value for UDP — the only relay transport we offer.
 /// Anything else is 442 Unsupported Transport Protocol.
@@ -186,6 +187,8 @@ pub struct Allocation {
     pub dropped: AtomicU64,
     /// Held for the allocation's life; releases the global cap on teardown.
     pub permit: Option<OwnedSemaphorePermit>,
+    /// Where peer traffic is written back to this client.
+    pub reply: Reply,
 }
 
 impl Allocation {
@@ -401,14 +404,21 @@ impl Server {
     /// This fires on a large fraction of real calls, because Chrome asks for
     /// permission on the remote peer's RFC1918 host candidates every time.
     pub fn peer_rejection(&self, peer: SocketAddr) -> Option<u16> {
+        // Port 0 is only meaningless where the port is actually used as a
+        // destination — ChannelBind and the outbound datapath. CreatePermission
+        // goes through `peer_ip_rejection`, because RFC 8656 §9.2 ignores the
+        // port there outright and a client is entitled to send zero.
         if peer.port() == 0 {
             return Some(400);
         }
-        let ip = Manager::canonicalize_ip(peer.ip());
+        self.peer_ip_rejection(peer.ip())
+            .or_else(|| self.self_addrs.contains(peer).then_some(403))
+    }
+
+    /// Policy check on a peer's IP alone — the granularity a permission uses.
+    pub fn peer_ip_rejection(&self, ip: IpAddr) -> Option<u16> {
+        let ip = Manager::canonicalize_ip(ip);
         if !self.cfg.allow_private && Manager::is_internal_dest(ip) {
-            return Some(403);
-        }
-        if self.self_addrs.contains(SocketAddr::new(ip, peer.port())) {
             return Some(403);
         }
         if self.blocks().blocks_ip(ip) {
@@ -618,6 +628,962 @@ pub fn data_indication(peer: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
     b.push_xor_addr(attr::XOR_PEER_ADDRESS, peer);
     b.push(attr::DATA, payload);
     b.finish(None, false)
+}
+
+/// Outcome of the long-term credential check.
+enum Auth {
+    Ok {
+        key: [u8; 16],
+        userid: String,
+    },
+    /// 401 Unauthenticated or 438 Stale Nonce — both answered with a fresh
+    /// challenge.
+    Challenge(u16),
+    /// MESSAGE-INTEGRITY present but USERNAME/REALM/NONCE missing. RFC 8489
+    /// §9.2.4 wants a 400 here, and it must not carry any of those attributes.
+    BadRequest,
+}
+
+/// Verify a request's long-term credentials.
+///
+/// The check order is normative (RFC 8489 §9.2.4) and not interchangeable:
+/// testing the nonce before the HMAC would let an unauthenticated attacker
+/// probe nonce validity, and would answer 438 where the RFC wants 401.
+fn authenticate(srv: &Server, m: &stun::Message<'_>, client: SocketAddr, t: u64) -> Auth {
+    let Some(mi) = m.mi_offset else {
+        return Auth::Challenge(401);
+    };
+    let (Some(user), Some(realm), Some(nonce)) = (
+        stun::first(m, attr::USERNAME),
+        stun::first(m, attr::REALM),
+        stun::first(m, attr::NONCE),
+    ) else {
+        return Auth::BadRequest;
+    };
+    let (Ok(user), Ok(realm), Ok(nonce)) = (
+        std::str::from_utf8(user),
+        std::str::from_utf8(realm),
+        std::str::from_utf8(nonce),
+    ) else {
+        return Auth::BadRequest;
+    };
+
+    // The client echoes back whatever realm we sent; the key derivation must
+    // use the same bytes, so a mismatch can never authenticate.
+    let cred = match turn_auth::parse_username(user, t, srv.cfg.effective_horizon()) {
+        Ok(c) => c,
+        Err(_) => return Auth::Challenge(401),
+    };
+    let key = match turn_auth::credential_key(&srv.secret, user, realm) {
+        Ok(k) => k,
+        Err(_) => return Auth::Challenge(401),
+    };
+    if !stun::verify_integrity(m.raw, mi, &key) {
+        return Auth::Challenge(401);
+    }
+    // Only once the HMAC verifies does nonce freshness become the client's
+    // problem to fix.
+    if !turn_auth::check_nonce(&srv.nonce_key, client, nonce, t) {
+        return Auth::Challenge(438);
+    }
+    Auth::Ok {
+        key,
+        userid: cred.userid,
+    }
+}
+
+/// Address family of a peer address, as RFC 6156 numbers it.
+fn family_of(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(_) => FAMILY_V4,
+        IpAddr::V6(_) => FAMILY_V6,
+    }
+}
+
+/// Tear an allocation down: cascade to permissions, channels and the relay
+/// socket, return the port, release the cap permit, and write history.
+///
+/// Single owner, mirroring the UDP forwarder: every exit cause converges on
+/// cancelling the `ConnEntry` token, which ends the relay task, which runs this
+/// exactly once. The 5-tuple is freed immediately so a re-Allocate from the same
+/// source port succeeds instead of hitting 437.
+fn teardown(srv: &Arc<Server>, tuple: &FiveTuple) {
+    let Some((_, alloc)) = srv.allocations.remove(tuple) else {
+        return;
+    };
+    srv.ports.lock().unwrap().give(alloc.port);
+    if let Some(mut n) = srv.per_user.get_mut(&alloc.userid) {
+        *n = n.saturating_sub(1);
+    }
+    srv.per_user.remove_if(&alloc.userid, |_, n| *n == 0);
+
+    // Allocations that relayed nothing and lived briefly are not recorded. An
+    // Allocate/Refresh(0) loop is a single round trip, so writing a row per
+    // cycle would let one credential fill the disk — and when RocksDB's
+    // filesystem fills, the config store goes with it.
+    let moved = alloc.entry.bytes_sent.load(Ordering::Relaxed)
+        + alloc.entry.bytes_received.load(Ordering::Relaxed);
+    let lived = crate::model::now_ms() - alloc.entry.started_at;
+    if moved > 0 || lived > 5_000 {
+        crate::relay::udp_session_end(&srv.manager.storage, &srv.runtime, &alloc.entry);
+    } else {
+        srv.runtime.conns.remove(&alloc.entry.id);
+    }
+}
+
+/// Per-allocation relay reader: peer → client.
+///
+/// The single owner of teardown for this allocation.
+async fn relay_task(srv: Arc<Server>, tuple: FiveTuple, alloc: Arc<Allocation>) {
+    let mut buf = vec![0u8; srv.cfg.effective_max_datagram()];
+    let cancel = alloc.entry.cancel.clone();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            r = alloc.relay.recv_from(&mut buf) => {
+                let (n, peer) = match r {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("turn: relay recv for {} ended: {e}", tuple.client);
+                        break;
+                    }
+                };
+                let t = now();
+                if !alloc.alive(t) {
+                    break;
+                }
+                // Break the amplification loop even if a permission slipped
+                // through: a datagram whose SOURCE is one of our own relay
+                // ports is either a loop or a spoof, never real peer traffic.
+                if srv.self_addrs.is_own_relay(peer) {
+                    alloc.dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let permitted = alloc.perms.lock().unwrap().allowed(peer.ip(), t);
+                if !permitted || !srv.peer_send_allowed(peer) {
+                    alloc.dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // ChannelData when a channel is bound to this peer, a Data
+                // indication otherwise (RFC 8656 §11.3 / §12.6).
+                let bound = alloc.channels.lock().unwrap().num_of(peer, t);
+                let frame = match bound {
+                    Some(num) => Some(channel_data(num, &buf[..n], tuple.transport)),
+                    None => data_indication(peer, &buf[..n]),
+                };
+                if let Some(f) = frame {
+                    alloc.reply.send(&f).await;
+                    alloc.entry.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    teardown(&srv, &tuple);
+}
+
+/// Handle one client message. See the module docs for why the order is fixed.
+pub async fn handle_message(srv: &Arc<Server>, tuple: FiveTuple, buf: &[u8], reply: &Reply) {
+    // 1. Demux on the first byte (RFC 7983 via RFC 8656 Table 3).
+    match buf.first().copied() {
+        Some(0..=3) => {}
+        Some(64..=79) => {
+            handle_channel_data(srv, tuple, buf).await;
+            return;
+        }
+        // Never answer garbage: on UDP a response to an unparseable datagram
+        // is a free reflection primitive.
+        _ => return,
+    }
+
+    let Some(m) = stun::parse(buf) else { return };
+    let t = now();
+
+    // 2. Binding is answered immediately, unauthenticated, before any
+    //    allocation lookup. Chrome shares one socket between its UDPPort and
+    //    TurnPort, so a plain Binding arrives on the same 5-tuple as the
+    //    Allocate; a 401/437/441 here costs it the srflx candidate.
+    if m.method == method::BINDING {
+        if m.class == Class::Request
+            && srv.rrl.allow_at(tuple.client.ip(), t as u32)
+            && let Some(out) = binding_response(m.txid, tuple.client, m.has_fingerprint)
+        {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    // 3. Indications are never answered and never authenticated.
+    if m.class == Class::Indication {
+        if m.method == method::SEND {
+            handle_send(srv, tuple, &m).await;
+        }
+        return;
+    }
+    if m.class != Class::Request {
+        return;
+    }
+
+    // 4. Long-term credentials, in the RFC's order.
+    let (key, userid) = match authenticate(srv, &m, tuple.client, t) {
+        Auth::Ok { key, userid } => (key, userid),
+        Auth::BadRequest => {
+            if srv.rrl.allow_at(tuple.client.ip(), t as u32)
+                && let Some(out) =
+                    error_response(400, "Bad Request", m.txid, m.method, None, m.has_fingerprint, &[])
+            {
+                reply.send(&out).await;
+            }
+            return;
+        }
+        Auth::Challenge(code) => {
+            // The mandatory challenge is an unauthenticated response, i.e. a
+            // reflection amplifier by construction — rate limit it.
+            if srv.rrl.allow_at(tuple.client.ip(), t as u32) {
+                let nonce = turn_auth::issue_nonce(&srv.nonce_key, tuple.client, t);
+                if let Some(out) = challenge(code, &srv.realm, &nonce, m.txid, m.method) {
+                    reply.send(&out).await;
+                }
+            }
+            return;
+        }
+    };
+
+    // 5. Unknown comprehension-required attributes, now that we can sign the
+    //    answer. EVEN-PORT and RESERVATION-TOKEN land here by design: 420 is
+    //    the RFC-prescribed way to say "unsupported" and clients retry without.
+    if !m.unknown_required.is_empty() {
+        if let Some(out) = error_response(
+            420,
+            "Unknown Attribute",
+            m.txid,
+            m.method,
+            Some(&key),
+            m.has_fingerprint,
+            &m.unknown_required,
+        ) {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    if m.method == method::ALLOCATE {
+        handle_allocate(srv, tuple, &m, &key, &userid, reply).await;
+        return;
+    }
+
+    // 6. Every other request needs an existing allocation on this 5-tuple.
+    let Some(alloc) = srv.allocations.get(&tuple).map(|a| a.clone()) else {
+        if let Some(out) = error_response(
+            437,
+            "Allocation Mismatch",
+            m.txid,
+            m.method,
+            Some(&key),
+            m.has_fingerprint,
+            &[],
+        ) {
+            reply.send(&out).await;
+        }
+        return;
+    };
+
+    // 7. Anti-hijack: the same credential that created the allocation must be
+    //    the one refreshing it. Compared on the USERID half only — the REST
+    //    timestamp prefix rotates, so comparing the full username would kill
+    //    live allocations for any client that re-derives credentials.
+    if alloc.userid != userid {
+        if let Some(out) = error_response(
+            441,
+            "Wrong Credentials",
+            m.txid,
+            m.method,
+            Some(&key),
+            m.has_fingerprint,
+            &[],
+        ) {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    match m.method {
+        method::REFRESH => handle_refresh(srv, tuple, &m, &alloc, &key, reply).await,
+        method::CREATE_PERMISSION => handle_create_permission(srv, &m, &alloc, &key, reply).await,
+        method::CHANNEL_BIND => handle_channel_bind(srv, &m, &alloc, &key, reply).await,
+        _ => {
+            if let Some(out) = error_response(
+                400,
+                "Bad Request",
+                m.txid,
+                m.method,
+                Some(&key),
+                m.has_fingerprint,
+                &[],
+            ) {
+                reply.send(&out).await;
+            }
+        }
+    }
+}
+
+async fn handle_allocate(
+    srv: &Arc<Server>,
+    tuple: FiveTuple,
+    m: &stun::Message<'_>,
+    key: &[u8; 16],
+    userid: &str,
+    reply: &Reply,
+) {
+    let t = now();
+    let fp = m.has_fingerprint;
+    let fail = |code: u16, reason: &'static str| {
+        error_response(code, reason, m.txid, method::ALLOCATE, Some(key), fp, &[])
+    };
+
+    // A retransmitted Allocate (same 5-tuple AND same transaction id) replays
+    // the success response. Treating it as a duplicate instead would make one
+    // lost response cost Chrome a full socket teardown, and it only retries
+    // twice before giving up on relay gathering entirely.
+    if let Some(existing) = srv.allocations.get(&tuple).map(|a| a.clone()) {
+        if existing.txid == m.txid {
+            let remaining = existing.expires.load(Ordering::Relaxed).saturating_sub(t);
+            if let Some(out) = allocate_success(
+                m.txid,
+                existing.relay.advertised(),
+                tuple.client,
+                remaining,
+                Some(key),
+                fp,
+            ) {
+                reply.send(&out).await;
+            }
+        } else if let Some(out) = fail(437, "Allocation Mismatch") {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    // REQUESTED-TRANSPORT is mandatory; only UDP relays are offered.
+    match stun::first(m, attr::REQUESTED_TRANSPORT) {
+        Some(v) if v.len() == 4 && v[0] == TRANSPORT_UDP => {}
+        Some(v) if v.len() == 4 => {
+            if let Some(out) = fail(442, "Unsupported Transport Protocol") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+        _ => {
+            if let Some(out) = fail(400, "Bad Request") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+    }
+
+    // RFC 6156 address family. Absent means IPv4.
+    let want_family = match stun::first(m, attr::REQUESTED_ADDRESS_FAMILY) {
+        None => FAMILY_V4,
+        Some(v) if v.len() == 4 && (v[0] == FAMILY_V4 || v[0] == FAMILY_V6) => v[0],
+        Some(_) => {
+            if let Some(out) = fail(400, "Bad Request") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+    };
+    if want_family != family_of(srv.relay_ip) {
+        // The client MUST NOT retry after 440, so this is the honest answer
+        // when the configured relay IP is the other family.
+        if let Some(out) = fail(440, "Address Family not Supported") {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    // Per-user quota, keyed on the userid rather than the rotating username.
+    let per_user = srv.cfg.effective_per_user();
+    {
+        let count = srv.per_user.get(userid).map(|n| *n).unwrap_or(0);
+        if count >= per_user {
+            if let Some(out) = fail(486, "Allocation Quota Reached") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+    }
+
+    // Global cap. 486 and 508 are the codes for transient exhaustion — never
+    // 401, which libwebrtc treats as a terminal credential failure and which
+    // would make the browser give up on this server entirely.
+    let Ok(permit) = srv.alloc_sem.clone().try_acquire_owned() else {
+        if let Some(out) = fail(486, "Allocation Quota Reached") {
+            reply.send(&out).await;
+        }
+        return;
+    };
+
+    let Some(port) = srv.ports.lock().unwrap().take() else {
+        if let Some(out) = fail(508, "Insufficient Capacity") {
+            reply.send(&out).await;
+        }
+        return;
+    };
+
+    let (sock, bound) = match crate::turn_relay::bind_relay(srv.relay_ip, port).await {
+        Ok(v) => v,
+        Err(e) => {
+            // EMFILE and friends are capacity, not a client error, and must not
+            // be retried into a syscall storm.
+            tracing::debug!("turn: relay bind on port {port} failed: {e}");
+            srv.ports.lock().unwrap().give(port);
+            if let Some(out) = fail(508, "Insufficient Capacity") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+    };
+    let advertised = srv.advertised(bound);
+    let relay = Arc::new(RelaySocket::new(sock, bound, advertised));
+
+    let lifetime = crate::turn_alloc::granted_lifetime(
+        stun::first(m, attr::LIFETIME)
+            .filter(|v| v.len() == 4)
+            .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]])),
+        srv.max_lifetime,
+    );
+
+    let entry = crate::relay::udp_session_start(
+        &srv.runtime,
+        tuple.client.to_string(),
+        advertised.to_string(),
+    );
+
+    let alloc = Arc::new(Allocation {
+        tuple,
+        txid: m.txid,
+        userid: userid.to_string(),
+        relay,
+        port,
+        perms: Mutex::new(Permissions::new(srv.cfg.effective_max_permissions())),
+        channels: Mutex::new(Channels::new(srv.cfg.effective_max_channels())),
+        expires: AtomicU64::new(t + lifetime),
+        entry,
+        dropped: AtomicU64::new(0),
+        permit: Some(permit),
+        reply: reply.clone(),
+    });
+    srv.allocations.insert(tuple, alloc.clone());
+    *srv.per_user.entry(userid.to_string()).or_insert(0) += 1;
+
+    let s = srv.clone();
+    let a = alloc.clone();
+    tokio::spawn(async move { relay_task(s, tuple, a).await });
+
+    if let Some(out) = allocate_success(m.txid, advertised, tuple.client, lifetime, Some(key), fp) {
+        reply.send(&out).await;
+    }
+}
+
+async fn handle_refresh(
+    srv: &Arc<Server>,
+    tuple: FiveTuple,
+    m: &stun::Message<'_>,
+    alloc: &Arc<Allocation>,
+    key: &[u8; 16],
+    reply: &Reply,
+) {
+    let requested = stun::first(m, attr::LIFETIME)
+        .filter(|v| v.len() == 4)
+        .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]));
+
+    match crate::turn_alloc::refresh_lifetime(requested, srv.max_lifetime) {
+        // LIFETIME=0 is the teardown signal, handled before any clamp. Echoing
+        // 600 here would make Chrome never release its port.
+        crate::turn_alloc::RefreshOutcome::Delete => {
+            if let Some(out) = refresh_success(m.txid, 0, Some(key), m.has_fingerprint) {
+                reply.send(&out).await;
+            }
+            alloc.entry.cancel.cancel();
+            teardown(srv, &tuple);
+        }
+        crate::turn_alloc::RefreshOutcome::Keep(n) => {
+            alloc.expires.store(now() + n, Ordering::Relaxed);
+            if let Some(out) = refresh_success(m.txid, n, Some(key), m.has_fingerprint) {
+                reply.send(&out).await;
+            }
+        }
+    }
+}
+
+async fn handle_create_permission(
+    srv: &Arc<Server>,
+    m: &stun::Message<'_>,
+    alloc: &Arc<Allocation>,
+    key: &[u8; 16],
+    reply: &Reply,
+) {
+    let t = now();
+    let fp = m.has_fingerprint;
+    let fail = |code: u16, reason: &'static str| {
+        error_response(code, reason, m.txid, method::CREATE_PERMISSION, Some(key), fp, &[])
+    };
+
+    // CreatePermission may carry MANY peer addresses; reading only the first
+    // would silently drop permissions for clients that batch them.
+    let raw = stun::all(m, attr::XOR_PEER_ADDRESS);
+    if raw.is_empty() || raw.len() > srv.cfg.effective_max_permissions() {
+        if let Some(out) = fail(if raw.is_empty() { 400 } else { 508 }, "Bad Request") {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    // Validate every peer BEFORE installing any: RFC 8656 §9.2 makes this
+    // atomic, so a partially-rejected request must install nothing.
+    let mut peers = Vec::with_capacity(raw.len());
+    for v in raw {
+        let Some(p) = stun::parse_xor_addr(&m.txid, v) else {
+            if let Some(out) = fail(400, "Bad Request") {
+                reply.send(&out).await;
+            }
+            return;
+        };
+        if family_of(p.ip()) != family_of(srv.relay_ip) {
+            if let Some(out) = fail(443, "Peer Address Family Mismatch") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+        // IP-granularity only: RFC 8656 §9.2 ignores the port in a
+        // CreatePermission, so a zero port here is legal, not malformed.
+        if let Some(code) = srv.peer_ip_rejection(p.ip()) {
+            // 403 for a policy refusal. libwebrtc prunes just that one
+            // connection; 401 would be a terminal auth failure and silence
+            // would burn its whole retransmission budget.
+            if let Some(out) = fail(code, if code == 403 { "Forbidden" } else { "Bad Request" }) {
+                reply.send(&out).await;
+            }
+            return;
+        }
+        peers.push(p);
+    }
+
+    // Install all or none. Capacity is checked first, inside the same lock, so
+    // a request that cannot fit entirely leaves the table untouched rather than
+    // installing a prefix and then answering 508.
+    let fits = {
+        let mut perms = alloc.perms.lock().unwrap();
+        perms.sweep(t);
+        let wanted: HashSet<IpAddr> = peers.iter().map(|p| p.ip()).collect();
+        let new = wanted.iter().filter(|ip| !perms.allowed(**ip, t)).count();
+        if perms.len() + new > srv.cfg.effective_max_permissions() {
+            false
+        } else {
+            for ip in wanted {
+                perms.install(ip, t);
+            }
+            true
+        }
+    };
+    let out = if fits {
+        bare_success(method::CREATE_PERMISSION, m.txid, Some(key), fp)
+    } else {
+        fail(508, "Insufficient Capacity")
+    };
+    if let Some(out) = out {
+        reply.send(&out).await;
+    }
+}
+
+async fn handle_channel_bind(
+    srv: &Arc<Server>,
+    m: &stun::Message<'_>,
+    alloc: &Arc<Allocation>,
+    key: &[u8; 16],
+    reply: &Reply,
+) {
+    let t = now();
+    let fp = m.has_fingerprint;
+    let fail = |code: u16, reason: &'static str| {
+        error_response(code, reason, m.txid, method::CHANNEL_BIND, Some(key), fp, &[])
+    };
+
+    let (Some(cn), Some(pv)) = (
+        stun::first(m, attr::CHANNEL_NUMBER).filter(|v| v.len() == 4),
+        stun::first(m, attr::XOR_PEER_ADDRESS),
+    ) else {
+        if let Some(out) = fail(400, "Bad Request") {
+            reply.send(&out).await;
+        }
+        return;
+    };
+    let num = u16::from_be_bytes([cn[0], cn[1]]);
+    let Some(peer) = stun::parse_xor_addr(&m.txid, pv) else {
+        if let Some(out) = fail(400, "Bad Request") {
+            reply.send(&out).await;
+        }
+        return;
+    };
+    if !crate::turn_alloc::valid_channel(num) {
+        if let Some(out) = fail(400, "Bad Request") {
+            reply.send(&out).await;
+        }
+        return;
+    }
+    if family_of(peer.ip()) != family_of(srv.relay_ip) {
+        if let Some(out) = fail(443, "Peer Address Family Mismatch") {
+            reply.send(&out).await;
+        }
+        return;
+    }
+    if let Some(code) = srv.peer_rejection(peer) {
+        if let Some(out) = fail(code, if code == 403 { "Forbidden" } else { "Bad Request" }) {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    let bind = alloc.channels.lock().unwrap().bind(num, peer, t);
+    match bind {
+        crate::turn_alloc::BindResult::BadRequest => {
+            if let Some(out) = fail(400, "Bad Request") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+        crate::turn_alloc::BindResult::Full => {
+            if let Some(out) = fail(508, "Insufficient Capacity") {
+                reply.send(&out).await;
+            }
+            return;
+        }
+        crate::turn_alloc::BindResult::Ok => {}
+    }
+
+    // A successful ChannelBind ALSO installs/refreshes the permission. Chrome
+    // stops sending CreatePermission once a channel is bound and relies solely
+    // on the 240 s ChannelBind refresh to keep both timers alive — treat the
+    // two tables as independent and every call dies at exactly t=300 s, with
+    // inbound traffic silently discarded and no error on either side.
+    let installed = alloc.perms.lock().unwrap().install(peer.ip(), t);
+    if !installed {
+        if let Some(out) = fail(508, "Insufficient Capacity") {
+            reply.send(&out).await;
+        }
+        return;
+    }
+
+    if let Some(out) = bare_success(method::CHANNEL_BIND, m.txid, Some(key), fp) {
+        reply.send(&out).await;
+    }
+}
+
+/// A Send indication: client → peer. Never answered, never authenticated
+/// beyond the 5-tuple, and never refreshes a timer.
+async fn handle_send(srv: &Arc<Server>, tuple: FiveTuple, m: &stun::Message<'_>) {
+    let Some(alloc) = srv.allocations.get(&tuple).map(|a| a.clone()) else {
+        return; // indications on an unknown 5-tuple are silently ignored
+    };
+    let (Some(pv), Some(data)) = (
+        stun::first(m, attr::XOR_PEER_ADDRESS),
+        stun::first(m, attr::DATA),
+    ) else {
+        return;
+    };
+    let Some(peer) = stun::parse_xor_addr(&m.txid, pv) else {
+        return;
+    };
+    send_to_peer(srv, &alloc, peer, data).await;
+}
+
+/// A ChannelData frame: client → peer.
+async fn handle_channel_data(srv: &Arc<Server>, tuple: FiveTuple, buf: &[u8]) {
+    if buf.len() < 4 {
+        return;
+    }
+    let num = u16::from_be_bytes([buf[0], buf[1]]);
+    let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    if buf.len() < 4 + len {
+        return; // declared length exceeds the datagram
+    }
+    let Some(alloc) = srv.allocations.get(&tuple).map(|a| a.clone()) else {
+        return;
+    };
+    let t = now();
+    let Some(peer) = alloc.channels.lock().unwrap().addr_of(num, t) else {
+        return;
+    };
+    send_to_peer(srv, &alloc, peer, &buf[4..4 + len]).await;
+}
+
+/// Shared outbound path for Send indications and ChannelData.
+async fn send_to_peer(srv: &Arc<Server>, alloc: &Arc<Allocation>, peer: SocketAddr, data: &[u8]) {
+    let t = now();
+    if !alloc.alive(t) {
+        return;
+    }
+    let permitted = alloc.perms.lock().unwrap().allowed(peer.ip(), t);
+    if !permitted || !srv.peer_send_allowed(peer) {
+        // Counted rather than merely dropped, so a client hammering the server
+        // with denied traffic is visible instead of looking idle.
+        alloc.dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    match alloc.relay.send_to(data, peer).await {
+        Ok(n) => {
+            alloc.entry.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Err(e) => tracing::debug!("turn: relay send to {peer} failed: {e}"),
+    }
+}
+
+/// Largest stream frame we will buffer: a maximal ChannelData plus its padding.
+/// STUN messages are capped far lower by [`stun::MAX_MESSAGE`].
+const MAX_FRAME: usize = 4 + 65535 + 3;
+
+/// Cancel every allocation this server owns (listener shutdown).
+fn cancel_all(srv: &Arc<Server>) {
+    for a in srv.allocations.iter() {
+        a.value().entry.cancel.cancel();
+    }
+}
+
+/// Expire allocations whose time-to-expiry has passed.
+///
+/// This is the *only* expiry mechanism for a TURN allocation. `idle_timeout_secs`
+/// is deliberately not applied: an allocation is legitimately silent for long
+/// stretches (relay is last-resort in ICE, so a call that starts on host or
+/// srflx has an idle allocation the whole time), and the client's keepalives —
+/// Refresh every ~540 s, ChannelBind every 240 s — move no bytes, so a
+/// byte-based idle timeout would tear down perfectly healthy allocations.
+pub async fn reap(srv: Arc<Server>, token: tokio_util::sync::CancellationToken) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tick.tick() => {
+                let t = now();
+                for a in srv.allocations.iter() {
+                    if !a.value().alive(t) {
+                        // Only cancel; the relay task owns teardown.
+                        a.value().entry.cancel.cancel();
+                    } else {
+                        a.value().perms.lock().unwrap().sweep(t);
+                        a.value().channels.lock().unwrap().sweep(t);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The UDP listener.
+pub async fn serve_udp(
+    srv: Arc<Server>,
+    sock: Arc<UdpSocket>,
+    token: tokio_util::sync::CancellationToken,
+) {
+    let server_addr = match sock.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("turn: udp listener has no local address: {e}");
+            return;
+        }
+    };
+    // One datagram never exceeds a maximal STUN message or ChannelData frame.
+    let mut buf = vec![0u8; MAX_FRAME];
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            r = sock.recv_from(&mut buf) => {
+                let (n, peer) = match r {
+                    Ok(v) => v,
+                    Err(e) => { tracing::debug!("turn: udp recv failed: {e}"); continue; }
+                };
+                if srv.manager.peer_blocked(&srv.runtime, &peer) {
+                    continue;
+                }
+                let tuple = FiveTuple {
+                    client: peer,
+                    server: server_addr,
+                    transport: Transport::Udp,
+                };
+                let reply = Reply::Udp { sock: sock.clone(), to: peer };
+                handle_message(&srv, tuple, &buf[..n], &reply).await;
+            }
+        }
+    }
+    cancel_all(&srv);
+}
+
+/// The TCP / TLS listener.
+///
+/// Deliberately not `Manager::accept_loop`: its per-connection semaphore would
+/// double-count against the allocation cap. That means the three controls it
+/// provides have to be reimplemented here — blocklist at accept, a connection
+/// cap, and a bounded TLS handshake — plus one it does not have: a
+/// pre-allocation idle timeout, so unauthenticated connections cannot be parked.
+pub async fn serve_stream(
+    srv: Arc<Server>,
+    listener: tokio::net::TcpListener,
+    token: tokio_util::sync::CancellationToken,
+    tls: Option<TlsAcceptor>,
+) {
+    let server_addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("turn: stream listener has no local address: {e}");
+            return;
+        }
+    };
+    let transport = if tls.is_some() {
+        Transport::Tls
+    } else {
+        Transport::Tcp
+    };
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            res = listener.accept() => {
+                let (stream, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => { tracing::warn!("turn: accept error: {e}"); continue; }
+                };
+                if srv.manager.peer_blocked(&srv.runtime, &peer) {
+                    continue;
+                }
+                let Ok(permit) = srv.conn_sem.clone().try_acquire_owned() else {
+                    tracing::debug!("turn: connection cap reached; refused {peer}");
+                    continue;
+                };
+                let s = srv.clone();
+                let t = token.clone();
+                let acceptor = tls.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match acceptor {
+                        None => {
+                            serve_conn(s, stream, peer, server_addr, transport, t).await;
+                        }
+                        Some(acc) => {
+                            // Bound the handshake: it is CPU work, so slowloris
+                            // on turns: costs more than on plain TCP.
+                            match tokio::time::timeout(
+                                crate::relay::HANDSHAKE_TIMEOUT,
+                                acc.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls_stream)) => {
+                                    serve_conn(s, tls_stream, peer, server_addr, transport, t).await;
+                                }
+                                Ok(Err(e)) => tracing::debug!("turn: TLS handshake failed: {e}"),
+                                Err(_) => tracing::debug!("turn: TLS handshake timed out"),
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    cancel_all(&srv);
+}
+
+/// One stream connection: frame, dispatch, and tear the allocation down on
+/// FIN/RST so a reconnect from the same ephemeral port does not hit 437.
+async fn serve_conn<S>(
+    srv: Arc<Server>,
+    stream: S,
+    peer: SocketAddr,
+    server_addr: SocketAddr,
+    transport: Transport,
+    token: tokio_util::sync::CancellationToken,
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let tuple = FiveTuple {
+        client: peer,
+        server: server_addr,
+        transport,
+    };
+    let (mut rd, wr) = tokio::io::split(stream);
+    let reply = Reply::Stream(Arc::new(StreamWriter::new(Box::new(wr))));
+
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        // Dispatch every complete frame already buffered.
+        loop {
+            if buf.len() < 4 {
+                break;
+            }
+            let Some(total) = frame_len(&buf) else {
+                // A byte stream has no resynchronisation point, so an
+                // unframeable byte means the connection is unusable.
+                tracing::debug!("turn: unframeable byte from {peer}; closing");
+                teardown(&srv, &tuple);
+                return;
+            };
+            let cap = if buf[0] < 4 {
+                stun::MAX_MESSAGE
+            } else {
+                MAX_FRAME
+            };
+            if total > cap {
+                tracing::debug!("turn: oversized frame ({total}) from {peer}; closing");
+                teardown(&srv, &tuple);
+                return;
+            }
+            if buf.len() < total {
+                break;
+            }
+            let frame: Vec<u8> = buf.drain(..total).collect();
+            handle_message(&srv, tuple, &frame, &reply).await;
+        }
+
+        // Until this connection owns an allocation, cap how long it may sit
+        // idle — accept_loop has no such control, so without it an attacker can
+        // park connections that never authenticate.
+        let idle = if srv.allocations.contains_key(&tuple) {
+            None
+        } else {
+            Some(PRE_ALLOCATION_IDLE)
+        };
+
+        let read = async {
+            match idle {
+                None => rd.read(&mut chunk).await.map(Some),
+                Some(d) => match tokio::time::timeout(d, rd.read(&mut chunk)).await {
+                    Ok(r) => r.map(Some),
+                    Err(_) => Ok(None),
+                },
+            }
+        };
+
+        tokio::select! {
+            _ = token.cancelled() => break,
+            r = read => match r {
+                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(n)) => {
+                    if buf.len() + n > MAX_FRAME * 2 {
+                        tracing::debug!("turn: {peer} buffered past the frame cap; closing");
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) => {
+                    tracing::debug!("turn: read from {peer} ended: {e}");
+                    break;
+                }
+            }
+        }
+    }
+    // FIN/RST ends the allocation: the 5-tuple must be free before the client
+    // reconnects from the same ephemeral port.
+    if let Some(a) = srv.allocations.get(&tuple).map(|a| a.clone()) {
+        a.entry.cancel.cancel();
+    }
+    teardown(&srv, &tuple);
 }
 
 #[cfg(test)]
