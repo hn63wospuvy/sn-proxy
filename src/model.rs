@@ -106,6 +106,14 @@ pub const TURN_DEFAULT_MAX_LIFETIME: u64 = 3600;
 /// RFC 8656 floor on a granted allocation lifetime.
 pub const TURN_MIN_LIFETIME: u64 = 600;
 
+/// Hard ceiling on a TURN relay read buffer.
+///
+/// A relayed datagram is wrapped in a Data indication — a 20-byte STUN header
+/// plus an XOR-PEER-ADDRESS TLV (up to 24 bytes for IPv6) plus the DATA TLV
+/// header — and the STUN length field is 16 bits. Leaving headroom below 65535
+/// keeps that wrapper representable no matter what an operator configures.
+pub const TURN_MAX_DATAGRAM: usize = 65_000;
+
 fn turn_default_transports() -> Vec<String> {
     vec!["udp".to_string(), "tcp".to_string()]
 }
@@ -219,8 +227,18 @@ impl TurnConfig {
         )
     }
 
+    /// Relay read-buffer size, capped at [`TURN_MAX_DATAGRAM`].
+    ///
+    /// The cap is not tuning advice, it is what keeps a Data indication
+    /// representable: the wrapper adds a STUN header and an XOR-PEER-ADDRESS
+    /// TLV on top of the payload, and the message's length field is 16 bits. An
+    /// operator who raised this to 65535 and an IPv6 peer sending a near-maximum
+    /// datagram would together overflow it.
     pub fn effective_max_datagram(&self) -> usize {
-        self.max_datagram.filter(|n| *n > 0).unwrap_or(2048)
+        self.max_datagram
+            .filter(|n| *n > 0)
+            .unwrap_or(2048)
+            .min(TURN_MAX_DATAGRAM)
     }
 
     pub fn effective_max_permissions(&self) -> usize {
@@ -506,8 +524,10 @@ mod tests {
     fn turn_effective_lifetime_defaults_to_3600() {
         // 600 would make the knob inert: granted = max(600, min(x, 600)) = 600.
         assert_eq!(TurnConfig::default().effective_max_lifetime(), 3600);
-        let mut t = TurnConfig::default();
-        t.max_lifetime_secs = Some(1200);
+        let mut t = TurnConfig {
+            max_lifetime_secs: Some(1200),
+            ..TurnConfig::default()
+        };
         assert_eq!(t.effective_max_lifetime(), 1200);
         t.max_lifetime_secs = Some(30);
         assert_eq!(t.effective_max_lifetime(), 600);
@@ -521,6 +541,20 @@ mod tests {
         // range, so a flood would starve every other proxy in this process of
         // ephemeral ports.
         assert_eq!(TurnConfig::default().effective_port_range(), (49152, 51199));
+    }
+
+    #[test]
+    fn turn_max_datagram_is_capped_so_a_data_indication_stays_representable() {
+        assert_eq!(TurnConfig::default().effective_max_datagram(), 2048);
+        let mut t = TurnConfig {
+            max_datagram: Some(65_535),
+            ..TurnConfig::default()
+        };
+        assert_eq!(t.effective_max_datagram(), TURN_MAX_DATAGRAM);
+        t.max_datagram = Some(0);
+        assert_eq!(t.effective_max_datagram(), 2048);
+        t.max_datagram = Some(1400);
+        assert_eq!(t.effective_max_datagram(), 1400);
     }
 
     #[test]
