@@ -22,6 +22,8 @@ mod tls;
 mod turn;
 mod turn_alloc;
 mod turn_auth;
+mod turn_relay;
+mod turn_rrl;
 mod udp;
 mod udp_socks;
 mod ws;

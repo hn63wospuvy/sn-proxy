@@ -823,6 +823,14 @@ impl Manager {
                     || v4.is_broadcast()
                     || v4.is_unspecified()
                     || o[0] == 100 && (64..=127).contains(&o[1]) // CGNAT 100.64/10
+                    // The ranges below matter more for TURN than for SOCKS5:
+                    // a TURN peer needs no handshake, so one permission plus a
+                    // single Send indication reaches anything reachable.
+                    || o[0] == 0                        // 0.0.0.0/8 — Linux treats the whole /8 as local
+                    || o[0] >= 240                      // 240.0.0.0/4 reserved
+                    || o[0] == 192 && o[1] == 0 && o[2] == 0   // 192.0.0.0/24 IETF protocol assignments
+                    || o[0] == 198 && (18..=19).contains(&o[1]) // 198.18.0.0/15 benchmarking
+                    || o[0] == 192 && o[1] == 88 && o[2] == 99 // 6to4 anycast relay — an amplification target
             }
             IpAddr::V6(v6) => {
                 let seg = v6.segments();
@@ -832,6 +840,8 @@ impl Manager {
                     || (seg[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
                     || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
                     || (seg[0] == 0x0064 && seg[1] == 0xff9b) // NAT64 prefix itself
+                    || seg[0] == 0x2002 // 6to4 2002::/16
+                    || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo 2001::/32
             }
         }
     }
@@ -1338,6 +1348,33 @@ mod udp_internal_tests {
     fn public_v4_allowed() {
         assert!(!Manager::is_internal_dest(v4(8, 8, 8, 8)));
         assert!(!Manager::is_internal_dest(v4(1, 1, 1, 1)));
+        // Adjacent to the ranges added for TURN, and must stay reachable.
+        assert!(!Manager::is_internal_dest(v4(192, 0, 2, 1))); // TEST-NET-1
+        assert!(!Manager::is_internal_dest(v4(198, 20, 0, 1)));
+        assert!(!Manager::is_internal_dest(v4(192, 88, 98, 1)));
+        assert!(!Manager::is_internal_dest(v4(203, 0, 113, 1)));
+    }
+
+    #[test]
+    fn v4_ranges_added_for_turn_are_blocked() {
+        // A TURN peer needs no handshake — one permission plus a single Send
+        // indication reaches anything — so the gaps that were tolerable for
+        // SOCKS5 are worth closing here.
+        assert!(Manager::is_internal_dest(v4(0, 1, 2, 3))); // 0.0.0.0/8
+        assert!(Manager::is_internal_dest(v4(240, 0, 0, 1))); // reserved
+        assert!(Manager::is_internal_dest(v4(255, 0, 0, 1))); // reserved
+        assert!(Manager::is_internal_dest(v4(192, 0, 0, 1))); // IETF assignments
+        assert!(Manager::is_internal_dest(v4(198, 18, 0, 1))); // benchmarking
+        assert!(Manager::is_internal_dest(v4(198, 19, 255, 1)));
+        assert!(Manager::is_internal_dest(v4(192, 88, 99, 1))); // 6to4 anycast
+    }
+
+    #[test]
+    fn v6_tunnel_ranges_added_for_turn_are_blocked() {
+        assert!(Manager::is_internal_dest("2002::1".parse().unwrap())); // 6to4
+        assert!(Manager::is_internal_dest("2001:0:1::1".parse().unwrap())); // Teredo
+        // A normal 2001:db8::/32 documentation address is not in Teredo's /32.
+        assert!(!Manager::is_internal_dest("2001:db8::1".parse().unwrap()));
     }
 
     #[test]
