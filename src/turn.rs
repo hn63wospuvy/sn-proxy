@@ -364,6 +364,13 @@ impl Server {
             advertise_ip,
             cfg,
         }))
+        .inspect(|s| {
+            tracing::debug!(
+                "turn: allocation cap {cap}, relay {min_port}-{max_port} on {relay_ip}, \
+                 {} rate-limit buckets",
+                s.rrl.footprint()
+            );
+        })
     }
 
     /// The current pre-parsed blocklist snapshot.
@@ -1044,6 +1051,15 @@ async fn handle_allocate(
     };
     let advertised = srv.advertised(bound);
     let relay = Arc::new(RelaySocket::new(sock, bound, advertised));
+    if relay.bound() != advertised {
+        // Under 1:1 NAT these differ, and a mismatch between what we bound and
+        // what we advertise is the first thing to check when ICE fails.
+        tracing::debug!(
+            "turn: allocation for {} relays on {} advertised as {advertised}",
+            tuple.client,
+            relay.bound()
+        );
+    }
 
     let lifetime = crate::turn_alloc::granted_lifetime(
         stun::first(m, attr::LIFETIME)

@@ -518,9 +518,17 @@ impl Manager {
     }
 
     /// Update an existing proxy's settings, restarting it if it was running.
-    pub async fn update(self: &Arc<Self>, id: &str, spec: ProxySpec) -> Result<ProxyConfig> {
-        spec.validate()?;
+    pub async fn update(self: &Arc<Self>, id: &str, mut spec: ProxySpec) -> Result<ProxyConfig> {
         let runtime = self.runtime(id)?;
+        // Resolve the tri-state TURN secret BEFORE validating. The snapshot
+        // never echoes it, so an edit form that does not retype it sends
+        // `None` — and validating that omission would make a TURN proxy
+        // uneditable, while treating it as "clear" would silently leave a relay
+        // that cannot authenticate anyone.
+        if spec.turn.static_secret.is_none() {
+            spec.turn.static_secret = runtime.config.lock().unwrap().turn.static_secret.clone();
+        }
+        spec.validate()?;
         let was_running = runtime.running.load(Ordering::SeqCst);
         if was_running {
             self.stop(id)?;
@@ -550,6 +558,8 @@ impl Manager {
             // One assignment for the whole TURN block. Every other setting here
             // is copied by hand, which is why a grouped struct is worth the
             // deviation: a forgotten line compiles and silently drops the edit.
+            // The secret's tri-state was already resolved at the top of
+            // update(), before validation.
             cfg.turn = spec.turn;
 
             // Tri-state PKCS#12 fields: keep / clear / replace.
@@ -1409,6 +1419,30 @@ mod tests {
         s.turn.relay_min_port = Some(60000);
         s.turn.relay_max_port = Some(50000);
         assert!(s.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn update_keeps_the_turn_secret_when_the_form_omits_it() {
+        // The snapshot never echoes the secret, so an edit that does not retype
+        // it sends null. Treating that as "clear" would silently leave a relay
+        // that cannot authenticate anyone — and validate() would not catch it,
+        // because the incoming spec looks fine on its own.
+        let m = temp_manager();
+        let cfg = m.create(turn_spec()).unwrap();
+        let mut edit = turn_spec();
+        edit.name = "renamed".into();
+        edit.turn.static_secret = None;
+        let after = m.update(&cfg.id, edit).await.unwrap();
+        assert_eq!(after.name, "renamed");
+        assert_eq!(after.turn.static_secret.as_deref(), Some("0123456789abcdef"));
+
+        // An explicit empty string still clears it.
+        let mut clear = turn_spec();
+        clear.turn.static_secret = Some(String::new());
+        // validate() refuses the cleared state, which is the point: the only
+        // way to end up with no secret is to ask for it explicitly, and that
+        // request is rejected rather than silently applied.
+        assert!(m.update(&cfg.id, clear).await.is_err());
     }
 
     #[tokio::test]

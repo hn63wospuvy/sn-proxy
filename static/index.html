@@ -303,6 +303,7 @@
           <option value="tcp">TCP forwarder</option>
           <option value="udp">UDP forwarder</option>
           <option value="websocket">WebSocket tunnel</option>
+          <option value="turn">TURN relay (WebRTC)</option>
         </select>
       </div>
       <div>
@@ -408,6 +409,79 @@
         </div>
       </div>
 
+      <!-- TURN relay (RFC 8656) -->
+      <div id="secTurn" class="section" style="display:none;">
+        <div class="section-title">TURN relay (RFC 8656)</div>
+        <div class="check-line">
+          <input type="checkbox" id="fTurnUdp" checked onchange="onTurnChange()" />
+          <label for="fTurnUdp">UDP listener (on the listen address)</label>
+        </div>
+        <div class="check-line">
+          <input type="checkbox" id="fTurnTcp" checked onchange="onTurnChange()" />
+          <label for="fTurnTcp">TCP listener (same port)</label>
+        </div>
+        <div class="check-line">
+          <input type="checkbox" id="fTurnTls" onchange="onTurnChange()" />
+          <label for="fTurnTls">TLS listener (turns:)</label>
+        </div>
+        <div id="rowTurnTlsAddr" style="display:none; margin-top:6px;">
+          <label>turns: listen address</label>
+          <input id="fTurnTlsAddr" placeholder="0.0.0.0:5349" />
+        </div>
+        <div class="hint" id="turnTransportHint"></div>
+
+        <div class="row2" style="margin-top:10px;">
+          <div><label>Realm (required)</label>
+            <input id="fTurnRealm" placeholder="turn.example.com" oninput="onTurnChange()" /></div>
+          <div><label>Shared secret (REST API)</label>
+            <input id="fTurnSecret" type="password" autocomplete="off" oninput="onTurnChange()" /></div>
+        </div>
+        <div class="hint" id="turnSecretHint"></div>
+        <button type="button" class="tiny" style="margin-top:6px;" onclick="genTurnCredential()">Generate a test credential</button>
+        <div class="hint" id="turnCredOut" style="word-break:break-all;"></div>
+
+        <div class="row2" style="margin-top:10px;">
+          <div><label>Relay IP (must be concrete)</label>
+            <input id="fTurnRelayIp" placeholder="203.0.113.10" oninput="onTurnChange()" /></div>
+          <div><label>Advertised relay IP (1:1 NAT)</label>
+            <input id="fTurnAdvertise" placeholder="" /></div>
+        </div>
+        <div class="hint" id="turnRelayHint"></div>
+
+        <div class="row2" style="margin-top:8px;">
+          <div><label>Relay port range — from</label>
+            <input id="fTurnMinPort" type="number" min="0" max="65535" placeholder="49152" /></div>
+          <div><label>to</label>
+            <input id="fTurnMaxPort" type="number" min="0" max="65535" placeholder="51199" /></div>
+        </div>
+        <div class="hint">Reserve this range at the OS level, or it competes with every other outbound socket this process opens.</div>
+
+        <div class="check-line" style="margin-top:10px;">
+          <input type="checkbox" id="fTurnAllowPrivate" onchange="onTurnChange()" />
+          <label for="fTurnAllowPrivate">Allow internal/private peer addresses (UNSAFE)</label>
+        </div>
+        <div class="hint" id="turnPrivateHint"></div>
+
+        <div class="row2" style="margin-top:8px;">
+          <div><label>Max allocation lifetime (s, 0 = 3600)</label>
+            <input id="fTurnLifetime" type="number" min="0" placeholder="3600" /></div>
+          <div><label>Max datagram (bytes, 0 = 2048)</label>
+            <input id="fTurnMaxDg" type="number" min="0" placeholder="2048" /></div>
+        </div>
+        <div class="row2" style="margin-top:8px;">
+          <div><label>Permissions per allocation (0 = 128)</label>
+            <input id="fTurnMaxPerms" type="number" min="0" placeholder="128" /></div>
+          <div><label>Channels per allocation (0 = 64)</label>
+            <input id="fTurnMaxChans" type="number" min="0" placeholder="64" /></div>
+        </div>
+        <div class="row2" style="margin-top:8px;">
+          <div><label>Allocations per user (0 = 16)</label>
+            <input id="fTurnPerUser" type="number" min="0" placeholder="16" /></div>
+          <div><label>Credential horizon (s, 0 = 86400)</label>
+            <input id="fTurnHorizon" type="number" min="0" placeholder="86400" /></div>
+        </div>
+      </div>
+
       <!-- advanced settings (all protocols) -->
       <div class="section">
         <div class="section-title">Advanced (0 = off)</div>
@@ -493,6 +567,11 @@ const CONN_COLLAPSE = 3;    // collapse active-connection tables longer than thi
 
 // PKCS#12 tri-state flags: true once the user clicked "remove".
 let clientP12Cleared = false, serverP12Cleared = false, truststoreCleared = false;
+// The TURN REST secret follows the same tri-state as the PKCS#12 fields:
+// omitted = keep, "" = clear, value = replace. It is never sent back to the
+// browser (the snapshot only carries has_turn_secret), so the form shows a
+// placeholder and only transmits what the operator actually typed.
+let turnSecretCleared = false;
 
 function fmtBytes(n) {
   if (n < 1024) return n + " B";
@@ -806,19 +885,92 @@ function onProtoChange() {
   const tcp = proto === "tcp";
   const ws = proto === "websocket";
   const udp = proto === "udp";
+  const turn = proto === "turn";
   const http = proto === "http" || proto === "https";
-  $("rowUser").style.display = (ss || tcp || udp) ? "none" : "";
+  // TURN authenticates with the REST API only, so the username/password rows
+  // would be misleading: they are not the credential a client presents.
+  $("rowUser").style.display = (ss || tcp || udp || turn) ? "none" : "";
   $("rowCipher").style.display = ss ? "" : "none";
   $("rowForward").style.display = (tcp || ws || udp) ? "" : "none";
   // TCP only: the header is written raw on the upstream socket, which has no
   // meaning inside a WebSocket tunnel and none at all over UDP.
   $("rowProxyProto").style.display = tcp ? "" : "none";
-  $("rowPass").style.display = (tcp || udp) ? "none" : "";
+  $("rowPass").style.display = (tcp || udp || turn) ? "none" : "";
   $("secHttp").style.display = http ? "" : "none";
-  $("secServerTls").style.display = (proto === "https") ? "" : "none";
+  // TURN's turns: listener uses the same PKCS#12 keystore as an HTTPS listener.
+  $("secServerTls").style.display = (proto === "https" || turn) ? "" : "none";
+  // ...but turns: clients never present a client certificate, and the server
+  // forces mtls off for TURN, so hide the checkbox rather than offer a setting
+  // that is silently ignored.
+  $("fMtls").parentElement.style.display = turn ? "none" : "";
+  if (turn) { $("rowTruststore").style.display = "none"; }
   $("lblPass").textContent = ss ? "Password (required)" : "Password";
   $("secSocks5").style.display = (proto === "socks5") ? "" : "none";
+  $("secTurn").style.display = turn ? "" : "none";
   if (proto === "socks5") onUdpChange();
+  if (turn) onTurnChange();
+}
+
+function onTurnChange() {
+  const tls = $("fTurnTls").checked;
+  $("rowTurnTlsAddr").style.display = tls ? "" : "none";
+
+  const udp = $("fTurnUdp").checked, tcp = $("fTurnTcp").checked;
+  let t = [];
+  if (!udp && !tcp && !tls) {
+    t.push("Select at least one transport.");
+  } else if (udp && !tcp && !tls) {
+    t.push("UDP only: Send indications and ChannelData carry no MESSAGE-INTEGRITY, "
+         + "so the 5-tuple is the only thing authenticating the relay datapath. "
+         + "turns:/TCP is the transport that resists spoofing.");
+  }
+  if (tls) {
+    t.push("turns: needs a real, publicly-trusted certificate whose SAN matches the hostname "
+         + "clients put in the turns: URL — browsers validate it against the OS trust store and "
+         + "there is no way to bypass that from JavaScript. The self-signed fallback is rejected "
+         + "by every browser.");
+  }
+  $("turnTransportHint").textContent = t.join(" ");
+
+  const realm = $("fTurnRealm").value.trim();
+  const secret = $("fTurnSecret").value;
+  let s = [];
+  if (!realm) {
+    s.push("A realm is required: browsers only recompute their credential hash when the realm "
+         + "changes, and start it empty, so an empty realm fails every allocation.");
+  }
+  if (secret && secret.length < 16) {
+    s.push("The shared secret must be at least 16 bytes — it is the only auth path, so a short "
+         + "or empty secret means anyone can mint valid credentials.");
+  }
+  $("turnSecretHint").textContent = s.join(" ");
+
+  $("turnRelayHint").textContent = $("fTurnRelayIp").value.trim()
+    ? "" : "Blank uses the listener's IP. It must resolve to a concrete address — a wildcard relay "
+         + "lets the kernel pick a source per route, which breaks ICE on multi-homed hosts.";
+
+  $("turnPrivateHint").textContent = $("fTurnAllowPrivate").checked
+    ? "UNSAFE: peers may reach loopback, RFC1918 and link-local addresses through this relay."
+    : "Recommended. Expect 403s during ICE for the far end's private candidates — that is normal.";
+}
+
+// Mint a REST credential the same way a signalling server would, so the
+// operator can test with turnutils or a browser without wiring one up first.
+// The secret never leaves the browser: it is only in the form.
+async function genTurnCredential() {
+  const secret = $("fTurnSecret").value;
+  const realm = $("fTurnRealm").value.trim();
+  const out = $("turnCredOut");
+  if (!secret) { out.textContent = "Enter the shared secret first."; return; }
+  const username = (Math.floor(Date.now() / 1000) + 3600) + ":test";
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(username));
+  const password = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  out.textContent = `username: ${username}   password: ${password}`
+    + (realm ? `   realm: ${realm}` : "   (set a realm too)")
+    + "   — valid for 1 hour";
 }
 function onUdpChange() {
   const assoc = $("fUdpAssoc").checked;
@@ -916,6 +1068,16 @@ function resetForm() {
   $("fUdpAssoc").checked = true; $("fUdpAllowPrivate").checked = false;
   $("fUdpBind").value = ""; $("fUdpAdvertise").value = "";
   $("fUdpMaxDg").value = ""; $("fUdpMaxDests").value = "";
+  turnSecretCleared = false;
+  $("fTurnUdp").checked = true; $("fTurnTcp").checked = true; $("fTurnTls").checked = false;
+  $("fTurnTlsAddr").value = ""; $("fTurnRealm").value = ""; $("fTurnSecret").value = "";
+  $("fTurnSecret").placeholder = ""; $("turnCredOut").textContent = "";
+  $("fTurnRelayIp").value = ""; $("fTurnAdvertise").value = "";
+  $("fTurnMinPort").value = ""; $("fTurnMaxPort").value = "";
+  $("fTurnAllowPrivate").checked = false;
+  $("fTurnLifetime").value = ""; $("fTurnMaxDg").value = "";
+  $("fTurnMaxPerms").value = ""; $("fTurnMaxChans").value = "";
+  $("fTurnPerUser").value = ""; $("fTurnHorizon").value = "";
   $("formErr").textContent = "";
   onMtlsChange();
 }
@@ -960,6 +1122,26 @@ function editProxy(id) {
   $("fUdpAdvertise").value = p.udp_advertise_ip || "";
   $("fUdpMaxDg").value = p.udp_max_datagram || "";
   $("fUdpMaxDests").value = p.udp_max_dests || "";
+  const t = p.turn || {};
+  const tr = t.transports || ["udp", "tcp"];
+  $("fTurnUdp").checked = tr.includes("udp");
+  $("fTurnTcp").checked = tr.includes("tcp");
+  $("fTurnTls").checked = tr.includes("tls");
+  $("fTurnTlsAddr").value = t.tls_listen || "";
+  $("fTurnRealm").value = t.realm || "";
+  // The secret is never echoed back; a placeholder says it is stored.
+  $("fTurnSecret").placeholder = t.has_turn_secret ? "(stored — type to replace)" : "";
+  $("fTurnRelayIp").value = t.relay_ip || "";
+  $("fTurnAdvertise").value = t.advertise_ip || "";
+  $("fTurnMinPort").value = t.relay_min_port || "";
+  $("fTurnMaxPort").value = t.relay_max_port || "";
+  $("fTurnAllowPrivate").checked = !!t.allow_private;
+  $("fTurnLifetime").value = t.max_lifetime_secs || "";
+  $("fTurnMaxDg").value = t.max_datagram || "";
+  $("fTurnMaxPerms").value = t.max_permissions || "";
+  $("fTurnMaxChans").value = t.max_channels || "";
+  $("fTurnPerUser").value = t.max_allocations_per_user || "";
+  $("fTurnHorizon").value = t.credential_horizon_secs || "";
   onProtoChange();
   onMtlsChange();
   $("formErr").textContent = (p.auth_enabled || p.protocol === "shadowsocks")
@@ -1018,12 +1200,52 @@ async function saveForm() {
     body.client_p12_alias = $("fClientP12Alias").value.trim() || null;
     body.client_p12_entry_password = $("fClientP12EntryPass").value || null;
   }
-  if (proto === "https") {
+  if (proto === "https" || proto === "turn") {
+    // A turns: listener uses the same keystore mechanism as an HTTPS listener.
     body.server_p12 = await p12Value("fServerP12", serverP12Cleared);
     body.server_p12_password = $("fServerP12Pass").value || null;
-    body.mtls_required = $("fMtls").checked;
-    body.server_truststore_p12 = await p12Value("fTruststore", truststoreCleared);
-    body.server_truststore_password = $("fTruststorePass").value || null;
+    // Never for TURN: turns: clients present no client certificate, and the
+    // server forces this off anyway.
+    body.mtls_required = proto === "https" && $("fMtls").checked;
+    if (proto === "https") {
+      body.server_truststore_p12 = await p12Value("fTruststore", truststoreCleared);
+      body.server_truststore_password = $("fTruststorePass").value || null;
+    }
+  }
+  if (proto === "turn") {
+    const transports = [];
+    if ($("fTurnUdp").checked) transports.push("udp");
+    if ($("fTurnTcp").checked) transports.push("tcp");
+    if ($("fTurnTls").checked) transports.push("tls");
+    const typed = $("fTurnSecret").value;
+    body.turn = {
+      transports,
+      tls_listen: $("fTurnTlsAddr").value.trim() || null,
+      realm: $("fTurnRealm").value.trim(),
+      // Tri-state, like the PKCS#12 fields: null keeps what is stored, so an
+      // edit that does not retype the secret does not wipe it.
+      static_secret: typed ? typed : (turnSecretCleared ? "" : null),
+      relay_ip: $("fTurnRelayIp").value.trim() || null,
+      advertise_ip: $("fTurnAdvertise").value.trim() || null,
+      relay_min_port: parseInt($("fTurnMinPort").value) || null,
+      relay_max_port: parseInt($("fTurnMaxPort").value) || null,
+      max_lifetime_secs: parseInt($("fTurnLifetime").value) || null,
+      allow_private: $("fTurnAllowPrivate").checked,
+      max_datagram: parseInt($("fTurnMaxDg").value) || null,
+      max_permissions: parseInt($("fTurnMaxPerms").value) || null,
+      max_channels: parseInt($("fTurnMaxChans").value) || null,
+      max_allocations_per_user: parseInt($("fTurnPerUser").value) || null,
+      credential_horizon_secs: parseInt($("fTurnHorizon").value) || null,
+    };
+    if (!transports.length) {
+      $("formErr").textContent = "Select at least one TURN transport."; return;
+    }
+    if (!body.turn.realm) {
+      $("formErr").textContent = "TURN needs a realm."; return;
+    }
+    if (transports.includes("tls") && !body.turn.tls_listen) {
+      $("formErr").textContent = "The TLS transport needs its own listen address."; return;
+    }
   }
   if (!body.name || !body.listen_addr) {
     $("formErr").textContent = "Name and listen address are required."; return;
@@ -1156,6 +1378,7 @@ const DOC_TABS = [
   { key: "tcp",          label: "TCP" },
   { key: "udp",          label: "UDP" },
   { key: "websocket",    label: "WebSocket" },
+  { key: "turn",         label: "TURN" },
 ];
 
 const DOCS = {
@@ -1437,6 +1660,72 @@ const DOCS = {
     </ul>
     <div class="note warn">For SOCKS5-mediated UDP with per-destination control and SSRF guards, use a
       SOCKS5 proxy with UDP ASSOCIATE instead of a raw UDP forwarder.</div>`,
+
+  turn: `
+    <h3>TURN relay (RFC 8656)</h3>
+    <p class="lead">Unlike every other protocol here, TURN does not forward to a destination you
+      configure. It <em>allocates a public relay address</em> for each authenticated client, then
+      relays datagrams between that address and the peers the client asks for. It is what WebRTC
+      falls back to when two endpoints cannot reach each other directly.</p>
+
+    <h4>Authentication</h4>
+    <p>Only the TURN REST API (coturn's <code>static-auth-secret</code> scheme). Your signalling
+      server mints short-lived credentials from the shared secret:</p>
+    <pre>username = "&lt;unix_expiry&gt;:&lt;userid&gt;"
+password = base64(HMAC-SHA1(secret, username))</pre>
+    <p>Use <span class="field">Generate a test credential</span> in the form to get a working pair
+      for <code>turnutils_uclient</code> or a browser. The secret never leaves your browser there,
+      and the server never sends it back to the admin UI once saved.</p>
+    <div class="note warn">The <span class="field">realm</span> is required. Browsers only recompute
+      their credential hash when the realm <em>changes</em> and start it empty, so an empty realm
+      makes every allocation fail with no useful error.</div>
+
+    <h4>Transports</h4>
+    <ul>
+      <li><span class="field">UDP</span> and <span class="field">TCP</span> share the listen address
+        (3478 by convention). <span class="field">TLS</span> (<code>turns:</code>) needs its own.</li>
+      <li>TURN/TLS on 443 is often the only thing that works from restrictive networks — which is
+        exactly when someone needs TURN at all.</li>
+      <li>Send indications and ChannelData carry no integrity tag, so over UDP the 5-tuple is the
+        only thing authenticating the relay datapath. <code>turns:</code>/TCP resists spoofing.</li>
+    </ul>
+    <div class="note warn"><code>turns:</code> needs a real, publicly-trusted certificate whose SAN
+      matches the hostname in the <code>turns:</code> URL. Browsers validate it against the OS trust
+      store with no JavaScript escape hatch, so the self-signed fallback is rejected every time.</div>
+
+    <h4>Relay addressing</h4>
+    <ul>
+      <li><span class="field">Relay IP</span> must be concrete, never a wildcard: ICE requires a
+        check response to come from the address the request went to, and a wildcard bind lets the
+        kernel pick per route. The failure looks like healthy traffic in a packet capture.</li>
+      <li><span class="field">Advertised relay IP</span> is for 1:1 NAT and only substitutes into
+        the address handed to clients.</li>
+      <li>Reserve the <span class="field">relay port range</span> at the OS level
+        (<code>net.ipv4.ip_local_reserved_ports</code>, or <code>netsh int ipv4 add
+        excludedportrange</code>) — otherwise it competes with every outbound socket this process
+        opens, and a flood starves the other proxies of ephemeral ports.</li>
+    </ul>
+
+    <h4>Security practices</h4>
+    <ul>
+      <li>Leave <span class="field">Allow internal/private peer addresses</span> OFF. Expect a
+        steady trickle of 403s during ICE for the far end's private candidates — that is normal and
+        browsers prune just that candidate.</li>
+      <li>A blocklist entry of the form <code>1.2.3.4:25</code> cannot refuse a <em>permission</em>,
+        because permissions are keyed on IP only by RFC mandate. It still applies per datagram. Use
+        a bare IP to refuse the permission itself.</li>
+      <li>Credentials are bearer tokens with no IP binding: anyone they are shared with can use the
+        relay. <span class="field">Credential horizon</span> caps how far in the future an expiry
+        may sit, and expiry is re-checked on every refresh.</li>
+      <li>The allocation cap is <span class="field">Max connections</span>, clamped to the relay
+        port range — every allocation binds a socket, so "unlimited" is not a coherent setting here
+        and is reduced with a warning.</li>
+    </ul>
+    <div class="note">Two deliberate differences from coturn, worth knowing if you are migrating:
+      credential expiry is re-checked on every Refresh (coturn checks it once, so allocations can
+      outlive their credential), and the per-user quota and anti-hijack check compare only the
+      <code>userid</code> half of the username — the timestamp prefix rotates, so comparing the
+      whole string would kill live allocations whenever a client re-derives credentials.</div>`,
 
   websocket: `
     <h3>WebSocket tunnel</h3>

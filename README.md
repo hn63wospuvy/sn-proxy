@@ -12,7 +12,9 @@ realtime web admin. Everything runs on a single Tokio runtime.
 | `https`       | HTTP proxy wrapped in TLS (config cert, per-proxy PKCS#12, or auto self-signed) |
 | `shadowsocks` | AEAD (`aes-256-gcm`, `aes-128-gcm`, `chacha20-ietf-poly1305`)  |
 | `tcp`         | Plain TCP forwarder to a fixed `host:port` destination         |
+| `udp`         | Plain UDP forwarder to a fixed `host:port` destination         |
 | `websocket`   | WebSocket tunnel (RFC 6455) to a fixed `host:port` destination |
+| `turn`        | TURN relay (RFC 8656) for WebRTC — UDP/TCP/TLS, REST-API auth  |
 
 Each proxy also has optional advanced tuning: **TCP keep-alive** interval,
 **idle timeout** (drop connections with no traffic), **connect timeout**
@@ -36,6 +38,40 @@ web admin:
   connecting clients to present a certificate (**mTLS**) validated against an
   uploaded PKCS#12 truststore.
 
+### TURN relay
+
+A `turn` proxy is a TURN server (RFC 8656) for WebRTC. It differs from every
+other protocol here: it does not forward to a destination you configure, it
+**allocates a public relay address** per authenticated client and relays between
+that address and the peers the client asks for.
+
+- **One proxy, up to three listeners** — UDP and TCP share the listen address
+  (3478 by convention); `turns:` (TLS) takes its own, and reuses the same PKCS#12
+  keystore mechanism as an `https` proxy.
+- **Auth is the TURN REST API only** (coturn's `static-auth-secret` scheme):
+  `username = "<unix_expiry>:<userid>"`,
+  `password = base64(HMAC-SHA1(secret, username))`. The web admin can mint a test
+  credential for you; the secret is never sent back to the browser once saved.
+- **A realm is required.** Browsers only recompute their credential hash when the
+  realm *changes* and initialise it empty, so an empty realm fails every
+  allocation with no useful error.
+- **The relay IP must be concrete**, never a wildcard: ICE requires a
+  connectivity-check response to arrive from the address the request was sent to,
+  and a wildcard bind lets the kernel choose per route.
+- **Reserve the relay port range** at the OS level. It defaults to
+  `49152–51199` — narrower than the RFC's recommendation, which collides exactly
+  with the Windows dynamic port range and would let a flood starve every other
+  proxy in the process of ephemeral ports.
+- `turns:` needs a **real, publicly-trusted certificate** whose SAN matches the
+  hostname clients use. Browsers validate it against the OS trust store with no
+  way to bypass it, so the built-in self-signed fallback is always rejected.
+
+Two deliberate differences from coturn: credential expiry is re-checked on every
+Refresh (coturn checks it once, so allocations can outlive their credential), and
+the per-user quota and the anti-hijack check compare only the `userid` half of the
+username — the timestamp prefix rotates, so comparing the whole string would kill
+live allocations whenever a client re-derives credentials.
+
 ### Connection control
 
 - **Terminate** any in-flight connection from the live table.
@@ -45,7 +81,7 @@ web admin:
 
 ## Features
 
-- **Six proxy protocols** — pick one per proxy instance (see table above)
+- **Eight proxy protocols** — pick one per proxy instance (see table above)
 - **Web admin** to create, edit, start/stop and delete multiple proxies — each
   with its own protocol, listen address and credentials
 - **Realtime monitoring** over a websocket (built on
@@ -224,7 +260,14 @@ curl -x https://127.0.0.1:1082 --proxy-insecure https://example.com
 | `http.rs`        | HTTP/HTTPS proxy (CONNECT, forwarding, header overrides, client mTLS) |
 | `shadowsocks.rs` | Shadowsocks AEAD server                                 |
 | `tcp.rs`         | Plain TCP forwarder                                     |
+| `udp.rs`         | Plain UDP forwarder                                     |
 | `ws_proxy.rs`    | WebSocket tunnelling proxy (RFC 6455)                   |
+| `stun.rs`        | STUN codec (RFC 8489) — pure, pinned to the RFC 5769 vectors |
+| `turn_auth.rs`   | TURN REST credentials and the stateless nonce           |
+| `turn_alloc.rs`  | TURN allocation/permission/channel state and the relay-port pool |
+| `turn.rs`        | TURN listeners, dispatch and allocation lifecycle       |
+| `turn_relay.rs`  | The relayed transport address — an opaque byte pipe     |
+| `turn_rrl.rs`    | Fixed-size response rate limiter for the TURN listeners |
 | `tls.rs`         | TLS acceptors/connectors: PEM, self-signed and PKCS#12  |
 | `relay.rs`       | Connection tracking, byte counting, keep-alive, timeouts |
 | `manager.rs`     | Proxy lifecycle, protocol dispatch, connection registry |
