@@ -358,6 +358,7 @@ mod tests {
             udp_advertise_ip: None,
             udp_max_datagram: None,
             udp_max_dests: None,
+            turn: crate::model::TurnConfig::default(),
             enabled: false,
         };
         Arc::new(ProxyRuntime::new(cfg))

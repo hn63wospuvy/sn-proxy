@@ -21,6 +21,8 @@ pub enum Protocol {
     Websocket,
     /// Plain UDP forwarder to a fixed destination.
     Udp,
+    /// TURN relay server (RFC 8656).
+    Turn,
 }
 
 impl Protocol {
@@ -33,6 +35,7 @@ impl Protocol {
             Protocol::Tcp => "tcp",
             Protocol::Websocket => "websocket",
             Protocol::Udp => "udp",
+            Protocol::Turn => "turn",
         }
     }
 
@@ -79,6 +82,209 @@ fn default_true() -> bool {
 /// Re-export of `default_true` for `serde(default = ...)` in other modules.
 pub fn model_default_true() -> bool {
     true
+}
+
+/// Default relay port range for a TURN proxy.
+///
+/// Deliberately NOT the RFC-recommended 49152-65535. That span is exactly the
+/// Windows default dynamic port range and overlaps Linux's, so it competes with
+/// every ephemeral bind this process already makes (the UDP forwarder's
+/// `0.0.0.0:0`, SOCKS5's per-destination sockets, every outbound connection from
+/// every other proxy). A TURN allocation flood that consumed the whole span
+/// would starve the other proxies of ephemeral ports — blast radius the entire
+/// process rather than the one proxy under attack.
+pub const TURN_DEFAULT_MIN_PORT: u16 = 49152;
+pub const TURN_DEFAULT_MAX_PORT: u16 = 51199;
+
+/// Default ceiling on a granted allocation lifetime.
+///
+/// 600 would make the knob unobservable: RFC 8656 floors the granted lifetime at
+/// 600, so `max(600, min(requested, 600))` is always 600 and the client's
+/// LIFETIME could never do anything. libwebrtc caps its own refresh scheduling
+/// at 3600, which makes 3600 the natural ceiling.
+pub const TURN_DEFAULT_MAX_LIFETIME: u64 = 3600;
+/// RFC 8656 floor on a granted allocation lifetime.
+pub const TURN_MIN_LIFETIME: u64 = 600;
+
+fn turn_default_transports() -> Vec<String> {
+    vec!["udp".to_string(), "tcp".to_string()]
+}
+
+/// TURN settings, grouped into one struct instead of flattened into
+/// [`ProxyConfig`] the way `ss_*` and `udp_*` are.
+///
+/// The grouping is not a style preference. `Manager::update` copies
+/// configuration field by field, so a forgotten line there compiles cleanly and
+/// silently discards the operator's edit — and for `static_secret` that means a
+/// TURN proxy left running with no usable credential. `cfg.turn = spec.turn` has
+/// nothing to forget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnConfig {
+    /// Listeners to bind: any subset of `udp`, `tcp`, `tls`.
+    #[serde(default = "turn_default_transports")]
+    pub transports: Vec<String>,
+    /// Listen address for the `turns:` (TLS) listener.
+    #[serde(default)]
+    pub tls_listen: Option<String>,
+    /// Authentication realm. Required and non-empty: libwebrtc only recomputes
+    /// its credential hash when the realm CHANGES and initialises it to `""`, so
+    /// a 401 carrying an empty realm never triggers the recompute — the hash
+    /// stays empty and every MESSAGE-INTEGRITY afterwards is computed over an
+    /// empty key. Chrome then fails 100% of the time.
+    #[serde(default)]
+    pub realm: String,
+    /// TURN REST API shared secret. A credential-minting key: whoever holds it
+    /// can issue unlimited valid credentials with arbitrary expiry. Never echoed
+    /// back over the API (see [`TurnView`]) and never logged.
+    #[serde(default)]
+    pub static_secret: Option<String>,
+    /// Concrete IP the relay sockets bind. Must not be a wildcard — ICE requires
+    /// a connectivity-check response to come from the address the request was
+    /// sent to, and a wildcard bind lets the kernel pick per route.
+    #[serde(default)]
+    pub relay_ip: Option<String>,
+    /// IP substituted into XOR-RELAYED-ADDRESS for 1:1 NAT. Never feeds
+    /// XOR-MAPPED-ADDRESS, which must carry the client's observed address.
+    #[serde(default)]
+    pub advertise_ip: Option<String>,
+    #[serde(default)]
+    pub relay_min_port: Option<u16>,
+    #[serde(default)]
+    pub relay_max_port: Option<u16>,
+    #[serde(default)]
+    pub max_lifetime_secs: Option<u64>,
+    /// Allow internal/RFC1918/SSRF-risky peer addresses. UNSAFE when true.
+    #[serde(default)]
+    pub allow_private: bool,
+    /// Relay read-buffer size. WebRTC media is under 1500 bytes; the 64 KiB the
+    /// UDP forwarder uses would be ~555 MiB of buffers at the default cap.
+    #[serde(default)]
+    pub max_datagram: Option<usize>,
+    #[serde(default)]
+    pub max_permissions: Option<u32>,
+    #[serde(default)]
+    pub max_channels: Option<u32>,
+    /// Allocations per userid — keyed on the userid, NOT the full REST username,
+    /// whose timestamp prefix rotates every second and would make the quota a
+    /// no-op.
+    #[serde(default)]
+    pub max_allocations_per_user: Option<u32>,
+    /// Reject credentials whose embedded expiry is further out than this.
+    #[serde(default)]
+    pub credential_horizon_secs: Option<u64>,
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            transports: turn_default_transports(),
+            tls_listen: None,
+            realm: String::new(),
+            static_secret: None,
+            relay_ip: None,
+            advertise_ip: None,
+            relay_min_port: None,
+            relay_max_port: None,
+            max_lifetime_secs: None,
+            allow_private: false,
+            max_datagram: None,
+            max_permissions: None,
+            max_channels: None,
+            max_allocations_per_user: None,
+            credential_horizon_secs: None,
+        }
+    }
+}
+
+impl TurnConfig {
+    /// Whether a transport (`udp` / `tcp` / `tls`) is selected.
+    pub fn has(&self, transport: &str) -> bool {
+        self.transports.iter().any(|t| t == transport)
+    }
+
+    /// Server ceiling on a granted allocation lifetime, never below the RFC
+    /// floor (a lower value would be inert, so clamp up rather than pretend the
+    /// operator configured something meaningful).
+    pub fn effective_max_lifetime(&self) -> u64 {
+        self.max_lifetime_secs
+            .filter(|s| *s > 0)
+            .unwrap_or(TURN_DEFAULT_MAX_LIFETIME)
+            .max(TURN_MIN_LIFETIME)
+    }
+
+    pub fn effective_port_range(&self) -> (u16, u16) {
+        (
+            self.relay_min_port.unwrap_or(TURN_DEFAULT_MIN_PORT),
+            self.relay_max_port.unwrap_or(TURN_DEFAULT_MAX_PORT),
+        )
+    }
+
+    pub fn effective_max_datagram(&self) -> usize {
+        self.max_datagram.filter(|n| *n > 0).unwrap_or(2048)
+    }
+
+    pub fn effective_max_permissions(&self) -> usize {
+        self.max_permissions.filter(|n| *n > 0).unwrap_or(128) as usize
+    }
+
+    pub fn effective_max_channels(&self) -> usize {
+        self.max_channels.filter(|n| *n > 0).unwrap_or(64) as usize
+    }
+
+    pub fn effective_per_user(&self) -> usize {
+        self.max_allocations_per_user.filter(|n| *n > 0).unwrap_or(16) as usize
+    }
+
+    pub fn effective_horizon(&self) -> u64 {
+        self.credential_horizon_secs
+            .filter(|s| *s > 0)
+            .unwrap_or(86_400)
+    }
+}
+
+/// The snapshot projection of [`TurnConfig`]: identical except that the
+/// credential-minting secret is reduced to a presence flag, mirroring the
+/// `has_client_p12` / omitted-`ss_password` convention the snapshot already
+/// follows for other secrets.
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnView {
+    pub transports: Vec<String>,
+    pub tls_listen: Option<String>,
+    pub realm: String,
+    pub has_turn_secret: bool,
+    pub relay_ip: Option<String>,
+    pub advertise_ip: Option<String>,
+    pub relay_min_port: Option<u16>,
+    pub relay_max_port: Option<u16>,
+    pub max_lifetime_secs: Option<u64>,
+    pub allow_private: bool,
+    pub max_datagram: Option<usize>,
+    pub max_permissions: Option<u32>,
+    pub max_channels: Option<u32>,
+    pub max_allocations_per_user: Option<u32>,
+    pub credential_horizon_secs: Option<u64>,
+}
+
+impl From<&TurnConfig> for TurnView {
+    fn from(c: &TurnConfig) -> Self {
+        Self {
+            transports: c.transports.clone(),
+            tls_listen: c.tls_listen.clone(),
+            realm: c.realm.clone(),
+            has_turn_secret: c.static_secret.as_deref().is_some_and(|s| !s.is_empty()),
+            relay_ip: c.relay_ip.clone(),
+            advertise_ip: c.advertise_ip.clone(),
+            relay_min_port: c.relay_min_port,
+            relay_max_port: c.relay_max_port,
+            max_lifetime_secs: c.max_lifetime_secs,
+            allow_private: c.allow_private,
+            max_datagram: c.max_datagram,
+            max_permissions: c.max_permissions,
+            max_channels: c.max_channels,
+            max_allocations_per_user: c.max_allocations_per_user,
+            credential_horizon_secs: c.credential_horizon_secs,
+        }
+    }
 }
 
 /// Persisted configuration of a single proxy instance.
@@ -194,6 +400,11 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub udp_max_dests: Option<u32>,
 
+    /// TURN settings (`Protocol::Turn` only). Grouped rather than flattened —
+    /// see [`TurnConfig`] for why.
+    #[serde(default)]
+    pub turn: TurnConfig,
+
     /// Whether the proxy should be running.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -251,6 +462,73 @@ mod tests {
         let json = r#"{"id":"x","name":"n","listen_addr":"0.0.0.0:1080"}"#;
         let cfg: ProxyConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.send_proxy_protocol);
+    }
+
+    #[test]
+    fn old_config_defaults_turn_block() {
+        // A config written before `turn` existed must still deserialize, and
+        // must default to a block that cannot authenticate anyone.
+        let json = r#"{"id":"x","name":"n","listen_addr":"0.0.0.0:1080"}"#;
+        let cfg: ProxyConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.turn.transports,
+            vec!["udp".to_string(), "tcp".to_string()]
+        );
+        assert_eq!(cfg.turn.realm, "");
+        assert_eq!(cfg.turn.static_secret, None);
+        assert_eq!(cfg.turn.max_lifetime_secs, None);
+        assert!(!cfg.turn.allow_private);
+    }
+
+    #[test]
+    fn turn_view_never_carries_the_secret() {
+        // The secret mints credentials, so the snapshot exposes only its
+        // presence — the same treatment client_p12 and ss_password already get.
+        let turn = TurnConfig {
+            static_secret: Some("super-secret-value".into()),
+            realm: "example.org".into(),
+            ..TurnConfig::default()
+        };
+        let view = TurnView::from(&turn);
+        assert!(view.has_turn_secret);
+        assert_eq!(view.realm, "example.org");
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("super-secret-value"));
+        // An empty string is "no secret", not "a secret that is empty".
+        let blank = TurnConfig {
+            static_secret: Some(String::new()),
+            ..TurnConfig::default()
+        };
+        assert!(!TurnView::from(&blank).has_turn_secret);
+    }
+
+    #[test]
+    fn turn_effective_lifetime_defaults_to_3600() {
+        // 600 would make the knob inert: granted = max(600, min(x, 600)) = 600.
+        assert_eq!(TurnConfig::default().effective_max_lifetime(), 3600);
+        let mut t = TurnConfig::default();
+        t.max_lifetime_secs = Some(1200);
+        assert_eq!(t.effective_max_lifetime(), 1200);
+        t.max_lifetime_secs = Some(30);
+        assert_eq!(t.effective_max_lifetime(), 600);
+        t.max_lifetime_secs = Some(0);
+        assert_eq!(t.effective_max_lifetime(), 3600);
+    }
+
+    #[test]
+    fn turn_relay_port_range_defaults_to_a_narrow_slice() {
+        // NOT the RFC's 49152-65535: that is exactly the Windows dynamic port
+        // range, so a flood would starve every other proxy in this process of
+        // ephemeral ports.
+        assert_eq!(TurnConfig::default().effective_port_range(), (49152, 51199));
+    }
+
+    #[test]
+    fn turn_transport_membership() {
+        let t = TurnConfig::default();
+        assert!(t.has("udp"));
+        assert!(t.has("tcp"));
+        assert!(!t.has("tls"));
     }
 
     #[test]

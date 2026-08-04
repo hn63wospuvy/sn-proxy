@@ -1828,6 +1828,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.2",
  "hkdf",
+ "hmac 0.13.0",
  "ipnet",
  "libc",
  "md-5",

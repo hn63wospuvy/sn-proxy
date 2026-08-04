@@ -1,7 +1,9 @@
 //! Owns every proxy instance: lifecycle (start/stop), live connection
 //! tracking and the broadcast channel feeding realtime monitoring.
 
-use crate::model::{BasicAuth, HeaderOverride, Protocol, ProxyConfig, effective_max_connections};
+use crate::model::{
+    BasicAuth, HeaderOverride, Protocol, ProxyConfig, TurnConfig, effective_max_connections,
+};
 use crate::monitor::{ActiveConn, MonitorEvent, ProxySnapshot};
 use crate::resources::ResourceSample;
 use crate::storage::Storage;
@@ -158,6 +160,7 @@ pub struct ProxySpec {
     pub udp_max_datagram: Option<usize>,
     pub udp_max_dests: Option<u32>,
     pub max_connections: Option<u32>,
+    pub turn: TurnConfig,
 }
 
 impl ProxySpec {
@@ -457,6 +460,7 @@ impl Manager {
             udp_advertise_ip: spec.udp_advertise_ip,
             udp_max_datagram: spec.udp_max_datagram,
             udp_max_dests: spec.udp_max_dests,
+            turn: spec.turn,
             enabled: false,
         };
         self.storage.save_config(&cfg)?;
@@ -495,6 +499,10 @@ impl Manager {
             cfg.udp_advertise_ip = spec.udp_advertise_ip;
             cfg.udp_max_datagram = spec.udp_max_datagram;
             cfg.udp_max_dests = spec.udp_max_dests;
+            // One assignment for the whole TURN block. Every other setting here
+            // is copied by hand, which is why a grouped struct is worth the
+            // deviation: a forgotten line compiles and silently drops the edit.
+            cfg.turn = spec.turn;
 
             // Tri-state PKCS#12 fields: keep / clear / replace.
             match spec.client_p12 {
@@ -946,6 +954,11 @@ impl Manager {
                                     // loop; it has its own listen path (see Task 5).
                                     Err(anyhow!("udp is not a stream protocol"))
                                 }
+                                Protocol::Turn => {
+                                    // TURN binds its own listeners in start(), so
+                                    // nothing ever reaches the shared accept loop.
+                                    Err(anyhow!("turn has its own listen path"))
+                                }
                             };
                             if let Err(e) = result {
                                 tracing::debug!("connection from {peer} ended: {e}");
@@ -1012,6 +1025,7 @@ impl Manager {
                 udp_advertise_ip: cfg.udp_advertise_ip.clone(),
                 udp_max_datagram: cfg.udp_max_datagram,
                 udp_max_dests: cfg.udp_max_dests,
+                turn: crate::model::TurnView::from(&cfg.turn),
                 max_connections: cfg.max_connections,
                 blocklist: {
                     let mut bl = cfg.blocklist.clone();
@@ -1067,6 +1081,7 @@ mod tests {
             udp_max_datagram: None,
             udp_max_dests: None,
             max_connections: None,
+            turn: TurnConfig::default(),
         }
     }
 
@@ -1248,6 +1263,7 @@ mod tests {
             udp_advertise_ip: None,
             udp_max_datagram: None,
             udp_max_dests: None,
+            turn: TurnConfig::default(),
             enabled: false,
         };
         ProxyRuntime::new(config)

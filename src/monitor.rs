@@ -1,6 +1,6 @@
 //! Realtime monitoring payloads broadcast to websocket clients.
 
-use crate::model::HeaderOverride;
+use crate::model::{HeaderOverride, TurnView};
 use serde::Serialize;
 
 /// A single live connection currently being relayed by a proxy.
@@ -55,6 +55,10 @@ pub struct ProxySnapshot {
     pub udp_advertise_ip: Option<String>,
     pub udp_max_datagram: Option<usize>,
     pub udp_max_dests: Option<u32>,
+    /// TURN settings (`Protocol::Turn` only). This is [`TurnView`], not
+    /// `TurnConfig`: the REST secret is reduced to `has_turn_secret` so a
+    /// credential-minting key never crosses the API.
+    pub turn: TurnView,
     /// Cap on concurrent connections (`None` = built-in default, `0` = unlimited).
     pub max_connections: Option<u32>,
     /// Source addresses blocked on this proxy specifically.

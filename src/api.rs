@@ -1,7 +1,7 @@
 //! Axum HTTP API and websocket route for the web admin.
 
 use crate::manager::{Manager, ProxySpec};
-use crate::model::{BasicAuth, HeaderOverride, Protocol};
+use crate::model::{BasicAuth, HeaderOverride, Protocol, TurnConfig};
 use crate::ws;
 use axum::{
     Json, Router,
@@ -222,6 +222,10 @@ struct ProxyForm {
     udp_max_dests: Option<u32>,
     #[serde(default)]
     max_connections: Option<u32>,
+    /// TURN settings. Omitted by non-TURN forms, so it defaults rather than
+    /// forcing every caller to send the block.
+    #[serde(default)]
+    turn: Option<TurnConfig>,
 }
 
 impl ProxyForm {
@@ -265,6 +269,7 @@ impl ProxyForm {
             // Pass through verbatim: `Some(0)` means "unlimited" (a deliberate
             // operator choice), so it must NOT be coerced to `None`/the default.
             max_connections: self.max_connections,
+            turn: self.turn.unwrap_or_default(),
         }
     }
 }
