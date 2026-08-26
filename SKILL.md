@@ -1,6 +1,6 @@
 ---
 name: sn-proxy-admin-api
-description: Use when an agent must create, update, start/stop, block, inspect or reconcile sn-proxy proxy instances over the HTTP admin API (`/api/proxies`, `/api/blocklist`, `/ws`) instead of clicking the web admin — covers login/session, the full ProxyForm field reference, per-protocol required fields, the full-replace update trap, and error recovery.
+description: Use when an agent must create, update, start/stop, block, inspect or reconcile sn-proxy proxy instances over the HTTP admin API (`/api/proxies`, `/api/blocklist`, `/ws`) instead of clicking the web admin — covers login/session, the full ProxyForm field reference (socks5/http/https/shadowsocks/tcp/websocket/udp/turn), per-protocol required fields, the full-replace update trap, and error recovery.
 ---
 
 # sn-proxy admin API
@@ -17,19 +17,20 @@ properties file — a bare port means `0.0.0.0`). All examples use
 1. **Log in first, keep the cookie.** Every `/api/*` route except
    `/api/session`, `/api/login`, `/api/logout` and `/` is behind a session check.
 2. **`POST /api/proxies/{id}` is a full replace, not a patch.** Any field you
-   omit reverts to its default — except the four PKCS#12 groups, which are
-   tri-state. See §5.
+   omit reverts to its default — except the PKCS#12 groups and
+   `turn.static_secret`, which are tri-state. See §5.
 3. **`GET /api/proxies` never returns secrets.** No proxy password, no
-   Shadowsocks password, no keystore password. A blind read-modify-write wipes
-   them. Keep your own desired-state, or re-send the secrets. See §5.
+   Shadowsocks password, no keystore password, no TURN `static_secret`
+   (`has_turn_secret` instead). A blind read-modify-write wipes them. Keep your
+   own desired-state, or re-send the secrets. See §5.
 4. **Create leaves the proxy stopped.** A new proxy has `enabled: false` and is
    not listening until you `POST /api/proxies/{id}/start`.
 5. **Nothing is unique.** Two proxies may share a name *and* a listen address;
    the collision only surfaces as a bind error at start. Reconcile by listing
    first (§6) or you will create duplicates on every run.
 6. **Never print secrets.** `POST /api/proxies` echoes back the full
-   `ProxyConfig` *including* passwords and base64 keystores. Do not log the
-   response body verbatim.
+   `ProxyConfig` *including* passwords, base64 keystores and
+   `turn.static_secret`. Do not log the response body verbatim.
 
 ## 1. Routes
 
@@ -114,33 +115,34 @@ Only `name` and `listen_addr` are structurally required; `protocol` defaults to
 | Field | Type | Applies to | Semantics |
 |---|---|---|---|
 | `name` | string | all | Required. No control characters, ≤200 chars (it is rendered in the admin UI). |
-| `protocol` | enum | all | `socks5`\|`http`\|`https`\|`shadowsocks`\|`tcp`\|`websocket`\|`udp`. Omitted ⇒ `socks5`. |
-| `listen_addr` | string | all | Required, e.g. `0.0.0.0:1080`. Not validated until start. |
-| `auth` | `{username,password}` | socks5, http, https, websocket | Omitted, or `username` exactly `""` ⇒ no auth. |
+| `protocol` | enum | all | `socks5`\|`http`\|`https`\|`shadowsocks`\|`tcp`\|`websocket`\|`udp`\|`turn`. Omitted ⇒ `socks5`. |
+| `listen_addr` | string | all | Required, e.g. `0.0.0.0:1080`. Not validated until start. TURN UDP/TCP share this address (3478 by convention). |
+| `auth` | `{username,password}` | socks5, http, https, websocket | Omitted, or `username` exactly `""` ⇒ no auth. **Ignored for `turn`** — TURN authenticates with the REST API only (`turn.static_secret`). |
 | `ss_method` | string | shadowsocks | Required: `aes-128-gcm`, `aes-256-gcm` or `chacha20-ietf-poly1305`. |
 | `ss_password` | string | shadowsocks | Required, non-empty. |
-| `forward_to` | `host:port` | tcp, websocket, udp | **Required for these three.** Ignored elsewhere. |
+| `forward_to` | `host:port` | tcp, websocket, udp | **Required for these three.** Ignored elsewhere (TURN has no fixed destination). |
 | `keepalive_secs` | int | all | `0`/omitted ⇒ off. |
 | `idle_timeout_secs` | int | all | `0`/omitted ⇒ off (udp applies its own 60 s default). |
 | `connect_timeout_secs` | int | all | `0`/omitted ⇒ off. |
-| `max_connections` | int | all | Omitted/`null` ⇒ **8888**; `0` ⇒ **unlimited**; `n` ⇒ `n`. Passed through verbatim — `0` is not coerced. |
+| `max_connections` | int | all | Omitted/`null` ⇒ **8888**; `0` ⇒ **unlimited**; `n` ⇒ `n`. Passed through verbatim — `0` is not coerced. On `turn`, `0` is still stored but the allocation cap is clamped to the relay port-range size. |
 | `send_proxy_protocol` | bool | tcp | PROXY protocol v1 header. Default `false`. See §7. |
 | `override_headers` | `[{key,value}]` | http, https | Injected on plain-forwarded HTTP. Blank `key` entries are dropped. |
 | `client_p12` | base64 | http, https | Client mTLS identity toward the destination. |
 | `client_p12_password` | string | http, https | |
 | `client_p12_alias` | string | http, https | Keystore entry; empty ⇒ first private key. |
 | `client_p12_entry_password` | string | http, https | Rarely needed. |
-| `server_p12` | base64 | https | Listener keystore; absent ⇒ the global `tls_cert`/`tls_key` or a self-signed cert. |
-| `server_p12_password` | string | https | |
+| `server_p12` | base64 | https, turn | Listener keystore for `https` and for TURN's `turns:` (TLS) transport; absent ⇒ the global `tls_cert`/`tls_key` or a self-signed cert. Browsers reject that fallback on `turns:` — see §7. |
+| `server_p12_password` | string | https, turn | |
 | `server_truststore_p12` | base64 | https | CA set validating client certs. |
 | `server_truststore_password` | string | https | |
-| `mtls_required` | bool | https | Require a client certificate. Default `false`. |
+| `mtls_required` | bool | https | Require a client certificate. Default `false`. Forced off for `turn` (`turns:` clients never present one). |
 | `udp_associate_enabled` | bool | socks5 | **Omitted ⇒ `true`.** `false` makes the server reply `0x07` to `CMD=0x03`. |
 | `udp_allow_private` | bool | socks5 | Allows RFC1918/internal UDP destinations. **SSRF risk** — see §7. |
 | `udp_bind_addr` | string | socks5 | Relay socket bind; default = listener IP. |
 | `udp_advertise_ip` | string | socks5 | IP reported in `BND.ADDR` (NAT / multi-homed). |
 | `udp_max_datagram` | int | socks5 | Default 64 KiB. `0` ⇒ default. |
 | `udp_max_dests` | int | socks5 | `0`/omitted ⇒ unlimited. |
+| `turn` | object | turn | Nested TURN settings. Omitted ⇒ empty-realm / no-secret defaults, which **fail validate**. See the table below. Always send the whole object on update — only `static_secret` is tri-state. |
 
 Not settable through this body: `id` (server-generated UUID), `enabled` (use
 start/stop), `blocklist` (use the blocklist routes).
@@ -154,6 +156,47 @@ base64 -w0 client.p12                              # Linux/Git Bash
 ```powershell
 [Convert]::ToBase64String([IO.File]::ReadAllBytes('client.p12'))
 ```
+
+### `turn` object
+
+A `turn` proxy is a TURN server (RFC 8656): it allocates a relay address per
+authenticated client. It does not use `auth` or `forward_to`.
+
+| Field | Type | Semantics |
+|---|---|---|
+| `transports` | `string[]` | Any subset of `udp`, `tcp`, `tls`. Omitted ⇒ `["udp","tcp"]`. Empty ⇒ 400. An unknown value ⇒ 400 (not silently ignored). |
+| `tls_listen` | `host:port` | **Required when `tls` is selected.** Independent of `listen_addr` (5349 by convention). |
+| `realm` | string | **Required.** 1–127 printable ASCII, no space / `"` / `'` / `\`. An empty realm makes browsers fail every allocation (libwebrtc only recomputes its hash when the realm *changes*, and starts it empty). |
+| `static_secret` | string | REST-API minting key, **≥16 bytes**. Snapshot never returns it. Tri-state on update — see §5. Create must send it; omitting it is a 400, not "no auth". |
+| `relay_ip` | string | Concrete IP the relay sockets bind. Required at **start** (not create) if `listen_addr` is a wildcard; otherwise defaults to the listener IP. A wildcard value is rejected — ICE needs the reply to come from the address the check was sent to. |
+| `advertise_ip` | string | Substituted into XOR-RELAYED-ADDRESS for 1:1 NAT. Never used for XOR-MAPPED-ADDRESS. |
+| `relay_min_port` / `relay_max_port` | int | Default `49152`–`51199` (narrower than the RFC span so a flood cannot eat the process's ephemeral ports). Inverted range ⇒ 400. Reserve it at the OS. |
+| `max_lifetime_secs` | int | Ceiling on a granted allocation lifetime. `0`/omitted ⇒ 3600; floor 600. |
+| `allow_private` | bool | RFC1918 / loopback / link-local peers. Default `false`. UNSAFE — see §7. |
+| `max_datagram` | int | Relay read buffer. `0`/omitted ⇒ 2048; hard cap 65000. |
+| `max_permissions` | int | `0`/omitted ⇒ 128. |
+| `max_channels` | int | `0`/omitted ⇒ 64. |
+| `max_allocations_per_user` | int | Per the **userid** half of the REST username, not the full `expiry:userid` string (the timestamp prefix rotates). `0`/omitted ⇒ 16. |
+| `credential_horizon_secs` | int | Reject credentials whose embedded expiry is further out than this. `0`/omitted ⇒ 86400. |
+
+There is **no minting endpoint**. Compute the REST credential locally from the
+secret you just stored:
+
+```
+username = "<unix_expiry>:<userid>"   # both halves non-empty; first colon delimits
+password = base64(HMAC-SHA1(static_secret, username))
+```
+
+```bash
+python -c "import hmac,hashlib,base64,time
+s='YOUR_SECRET'; u=f'{int(time.time())+3600}:alice'
+print(u)
+print(base64.b64encode(hmac.new(s.encode(), u.encode(), hashlib.sha1).digest()).decode())"
+```
+
+`max_connections` still applies, but as an allocation cap, clamped to the relay
+port-range size. `0` (unlimited) is not honoured — every allocation binds a
+socket, so the cap becomes the range capacity.
 
 ### Minimal bodies per protocol
 
@@ -188,6 +231,21 @@ base64 -w0 client.p12                              # Linux/Git Bash
 // udp forwarder
 {"name":"dns","protocol":"udp","listen_addr":"0.0.0.0:5300",
  "forward_to":"8.8.8.8:53","idle_timeout_secs":60}
+
+// turn relay — listen_addr is UDP/TCP; send a concrete relay_ip when that
+// address is a wildcard, otherwise start() fails after create succeeded.
+{"name":"turn-eu","protocol":"turn","listen_addr":"0.0.0.0:3478",
+ "turn":{"transports":["udp","tcp"],"realm":"turn.example.com",
+         "static_secret":"<≥16 bytes>","relay_ip":"203.0.113.10"},
+ "max_connections":512}
+
+// turn with turns: — needs its own listen address AND a publicly-trusted
+// server_p12 whose SAN matches the hostname in the turns: URL.
+{"name":"turn-tls","protocol":"turn","listen_addr":"0.0.0.0:3478",
+ "server_p12":"<base64>","server_p12_password":"…",
+ "turn":{"transports":["udp","tcp","tls"],"tls_listen":"0.0.0.0:5349",
+         "realm":"turn.example.com","static_secret":"<≥16 bytes>",
+         "relay_ip":"203.0.113.10"}}
 ```
 
 ## 4. Create and start
@@ -212,18 +270,23 @@ Verify by re-listing rather than trusting the `200`: a start that fails answers
 `ProxyForm`; every absent field takes its serde default and is persisted. Send
 `{"name":"x","listen_addr":"0.0.0.0:1080"}` to "just rename" and you have also
 dropped `auth`, `forward_to`, `override_headers`, all timeouts, reset
-`max_connections` to the 8888 default and flipped `udp_associate_enabled` back
-to `true`. **Always send the complete intended state.**
+`max_connections` to the 8888 default, flipped `udp_associate_enabled` back
+to `true`, and replaced `turn` with empty-realm defaults (which then 400s if
+`protocol` is `turn`). **Always send the complete intended state.**
 
 **Trap 2: the snapshot has no secrets.** `GET /api/proxies` returns
 `ProxySnapshot`, which carries `auth_enabled`/`auth_username` but no password,
-`ss_method` but no `ss_password`, and `has_client_p12`/`has_server_p12`/
-`has_truststore` booleans instead of keystores. Rebuilding a form from a
-snapshot therefore silently strips credentials. Either keep the desired state in
-your own config file and always send it in full, or re-supply the secrets on
-every update.
+`ss_method` but no `ss_password`, `has_client_p12`/`has_server_p12`/
+`has_truststore` booleans instead of keystores, and `turn.has_turn_secret`
+instead of `static_secret`. Rebuilding a form from a snapshot therefore
+silently strips credentials. Either keep the desired state in your own config
+file and always send it in full, or re-supply the secrets on every update.
 
-The PKCS#12 fields are the one exception — they are tri-state on update:
+PKCS#12 fields and `turn.static_secret` are tri-state on update. Everything
+else inside `turn` is a full replace of the nested object — omitting
+`allow_private` / `relay_ip` / port range / … resets them to defaults.
+
+PKCS#12 (`client_p12` / `server_p12` / `server_truststore_p12`):
 
 | Value sent | Effect |
 |---|---|
@@ -231,9 +294,19 @@ The PKCS#12 fields are the one exception — they are tri-state on update:
 | `""` (empty string) | **clear** the keystore *and* its associated passwords |
 | base64 string | **replace** it, and take the accompanying password fields |
 
-So the safe update recipe is: send every non-secret field explicitly, omit
-`client_p12` / `server_p12` / `server_truststore_p12` when you are not changing
-them, and re-send `auth` / `ss_password` from your own source of truth.
+`turn.static_secret` (resolved *before* validate, so an edit that does not
+retype it stays valid):
+
+| Value sent | Effect |
+|---|---|
+| field omitted / `null` | **keep** the stored secret |
+| `""` (empty string) | **400** — a missing secret is an open relay, so it cannot be cleared |
+| string ≥16 bytes | **replace** |
+
+So the safe update recipe is: send every non-secret field explicitly (including
+the full `turn` object), omit `client_p12` / `server_p12` /
+`server_truststore_p12` / `turn.static_secret` when you are not changing them,
+and re-send `auth` / `ss_password` from your own source of truth.
 
 Updating a **running** proxy stops it, saves, then starts it again — every live
 connection through it is dropped. Do it in a maintenance window, or check
@@ -279,12 +352,27 @@ option the user asks for, but say plainly what it costs:
   destination side is confirmed.
 - **`udp_allow_private: true`** — lets SOCKS5 UDP reach RFC1918/loopback/link-local
   targets. That is an SSRF pivot into the internal network.
+- **`turn.allow_private: true`** — same SSRF through the TURN relay: peers may
+  reach loopback, RFC1918 and link-local. Leave it off; 403s on the far end's
+  private ICE candidates are normal.
+- **TURN `transports: ["udp"]` only** — Send indications and ChannelData carry
+  no MESSAGE-INTEGRITY, so the 5-tuple is the only authenticator on the datapath.
+  `turns:`/`tcp` is the transport that resists spoofing.
+- **`turns:` without a publicly-trusted `server_p12`** — the listener falls back
+  to the global self-signed cert. Browsers validate `turns:` against the OS trust
+  store with no JS bypass, so every browser client is rejected. Start still
+  succeeds; the failure is on the client.
+- **TURN on `0.0.0.0`/`::` with no `relay_ip`** — create succeeds, start returns
+  400. A wildcard relay bind lets the kernel pick a source per route and breaks
+  ICE while a packet capture looks healthy.
 - **`max_connections: 0`** — unlimited. Removes the accept-time backstop against
-  connection floods; the default 8888 exists for that reason.
+  connection floods; the default 8888 exists for that reason. On `turn` it is
+  not unlimited: the allocation cap is clamped to the relay port-range size.
 - **`mtls_required: false` on an `https` listener** — anyone who can reach the
   port can use the proxy unless `auth` is set.
 - **No `auth` on socks5/http/https/websocket** — an open relay if the listen
-  address is routable. `0.0.0.0:…` on a public host means the internet.
+  address is routable. `0.0.0.0:…` on a public host means the internet. TURN
+  cannot be run without `static_secret` (≥16 bytes); that is the only auth path.
 - **Admin exposed without `admin_user`/`admin_password`** — the API you are
   calling is unauthenticated. Flag it; do not quietly "fix" it by editing the
   config.
@@ -303,10 +391,16 @@ fresh one every second:
    "auth_username":"alice","total_connections":42,
    "bytes_sent":1234,"bytes_received":5678,
    "blocklist":["1.2.3.4"],
+   "turn":{"transports":["udp","tcp"],"realm":"","has_turn_secret":false,
+     "allow_private":false},
    "active_connections":[{"id":"…","src_addr":"1.2.3.4:51234",
      "dst_addr":"example.com:443","bytes_sent":1,"bytes_received":2,
      "started_at":1750000000000}]}]}
 ```
+
+`turn` is always present on a snapshot (`TurnView`): same shape as the form
+object except `static_secret` is reduced to `has_turn_secret`. Non-TURN
+proxies still carry the default view (`has_turn_secret: false`, empty realm).
 
 For a one-shot read, `GET /api/proxies` returns the same `ProxySnapshot` array —
 prefer it over opening a websocket when you only need current state.
@@ -337,6 +431,10 @@ Both accept a bare `IP` (matches any source port) or an exact `IP:port`, and
 both drop matching live connections immediately on add. Removal takes the same
 `{"addr":…}` body via `DELETE`.
 
+On a `turn` proxy, permissions are keyed on **IP only** (RFC 8656). A block
+of the form `1.2.3.4:25` cannot refuse the permission itself; it still applies
+per datagram. Use a bare IP to refuse the permission.
+
 ```bash
 curl -s -b "$JAR" -X POST "$BASE/api/blocklist" \
   -H 'content-type: application/json' -d '{"addr":"203.0.113.7"}'
@@ -357,7 +455,16 @@ Note the per-proxy list is *not* cleared by an update (it is not part of
 | `400 {"error":"name must not contain control characters"}` | CR/LF/etc. in name | Strip them. |
 | `400 {"error":"name is too long (max 200 characters)"}` | | |
 | `400 {"error":"listen address is required"}` | | |
-| `400 {"error":"this proxy needs a forward destination (host:port)"}` | `tcp`/`websocket`/`udp` without `forward_to` | |
+| `400 {"error":"this proxy needs a forward destination (host:port)"}` | `tcp`/`websocket`/`udp` without `forward_to` | Not raised for `turn`. |
+| `400 {"error":"turn needs a realm: 1-127 printable ASCII characters, no space, quote or backslash (an empty realm makes browsers fail every allocation)"}` | Missing/illegal `turn.realm` | |
+| `400 {"error":"turn needs a static_secret of at least 16 bytes — the REST API is the only auth path, so a short or empty secret is an open relay"}` | Missing/short secret on create, or `""` on update | Omit the field to keep the stored secret. |
+| `400 {"error":"turn needs at least one transport (udp, tcp or tls)"}` | `turn.transports` empty | Default if omitted is `["udp","tcp"]` — this fires when you send `[]`. |
+| `400 {"error":"unknown turn transport \"…\" (expected udp, tcp or tls)"}` | Typo in `transports` | |
+| `400 {"error":"the turn tls transport needs its own listen address (turns: port)"}` | `tls` without `tls_listen` | |
+| `400 {"error":"turn relay port range is inverted (X > Y)"}` | `relay_min_port` > `relay_max_port` | |
+| `400 {"error":"turn needs a concrete relay_ip when the listener binds a wildcard address"}` | Start, not create. `listen_addr` is `0.0.0.0`/`::` and `relay_ip` is blank | Set a concrete `relay_ip`. |
+| `400 {"error":"turn relay_ip must not be a wildcard address"}` | `relay_ip` is `0.0.0.0`/`::` | |
+| `400 {"error":"cannot bind <addr> (turn/udp\|tcp\|tls): …"}` | Port taken on that TURN transport | UDP and TCP share `listen_addr`; TLS uses `tls_listen`. A failed start leaves the proxy stopped (no partial bind). |
 | `400 {"error":"shadowsocks needs a cipher: …"}` | Bad/missing `ss_method` | Use one of the three ciphers. |
 | `400 {"error":"shadowsocks needs a password"}` | | |
 | `400 {"error":"proxy not found"}` | Wrong/stale `id` | Re-list. |
@@ -412,4 +519,4 @@ Invoke-RestMethod "$Base/api/proxies" -WebSession $S |
 ```
 
 `ConvertTo-Json` defaults to depth 2 and would flatten `auth` /
-`override_headers` into type names — always pass `-Depth 5` or more.
+`override_headers` / `turn` into type names — always pass `-Depth 5` or more.
