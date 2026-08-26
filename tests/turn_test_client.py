@@ -23,6 +23,9 @@ Scenarios, and what each one exists to catch:
       the same 5-tuple gets 437.
   (f) Refresh(LIFETIME=0) echoes 0 and frees the allocation. Answering 600
       there makes every closed PeerConnection leak a relay port on both sides.
+  (j) Refresh after REST credential expiry still succeeds; a new Allocate with
+      the same expired username is 401. Re-checking TTL on Refresh drops a live
+      call when the REST TTL elapses (LiveKit external TURN default 4h).
   (g) A peer sending a STUN Binding request TO THE RELAY ADDRESS is relayed to
       the client byte-identically inside a Data indication, and the server
       answers the peer with nothing. The relay socket is an opaque byte pipe;
@@ -311,9 +314,9 @@ class TcpTransport:
 # --------------------------------------------------------------------------
 
 class TurnClient:
-    def __init__(self, transport, secret, userid="tester"):
+    def __init__(self, transport, secret, userid="tester", ttl=3600):
         self.t = transport
-        self.username, self.password, self.key = credentials(secret, userid)
+        self.username, self.password, self.key = credentials(secret, userid, ttl=ttl)
         self.realm = None
         self.nonce = None
         self.relay = None
@@ -520,6 +523,30 @@ def scenario_allocate_retransmit(host, secret):
         c.close()
 
 
+def scenario_refresh_after_credential_expiry(host, secret):
+    """(j) Refresh outlives REST expiry; a new Allocate with that username does not."""
+    c = TurnClient(UdpTransport(host, TURN_PORT), secret, ttl=2)
+    try:
+        c.allocate()
+        time.sleep(3)
+        mt, attrs = c.refresh(600)
+        assert mt == REFRESH_SUCCESS, (
+            f"refresh after REST expiry failed: {error_code(attrs)} "
+            "(TTL is Allocate-only; re-checking it on Refresh drops live calls)"
+        )
+        c2 = TurnClient(UdpTransport(host, TURN_PORT), secret, userid="other")
+        c2.username, c2.password, c2.key = c.username, c.password, c.key
+        try:
+            _, mt2, _, attrs2, _ = c2.request(
+                ALLOCATE_REQ, [(A_REQUESTED_TRANSPORT, bytes([17, 0, 0, 0]))])
+            assert error_code(attrs2) == 401, (
+                f"expired Allocate should 401, got {error_code(attrs2)} mt={mt2:#06x}")
+        finally:
+            c2.close()
+    finally:
+        c.close()
+
+
 def scenario_refresh_zero(host, secret):
     """(f) Refresh(0) must echo 0, or clients never release their ports."""
     c = TurnClient(UdpTransport(host, TURN_PORT), secret)
@@ -688,6 +715,8 @@ def main():
         check("allocate retransmit vs duplicate", lambda: scenario_allocate_retransmit(
             args.host, SECRET))
         check("refresh(0) echoes zero", lambda: scenario_refresh_zero(args.host, SECRET))
+        check("refresh outlives REST expiry", lambda: scenario_refresh_after_credential_expiry(
+            args.host, SECRET))
         check("relay socket is an opaque pipe", lambda: scenario_opaque_relay(
             args.host, SECRET, args.allow_private))
         check("aiortc response-signing canary", lambda: scenario_aiortc(args.host, SECRET))

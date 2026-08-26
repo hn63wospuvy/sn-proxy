@@ -66,11 +66,14 @@ that address and the peers the client asks for.
   hostname clients use. Browsers validate it against the OS trust store with no
   way to bypass it, so the built-in self-signed fallback is always rejected.
 
-Two deliberate differences from coturn: credential expiry is re-checked on every
-Refresh (coturn checks it once, so allocations can outlive their credential), and
-the per-user quota and the anti-hijack check compare only the `userid` half of the
-username — the timestamp prefix rotates, so comparing the whole string would kill
-live allocations whenever a client re-derives credentials.
+REST credential expiry is an **Allocate-only** gate, matching coturn and LiveKit
+1.12: a Refresh / CreatePermission / ChannelBind on a live allocation still
+verifies HMAC and the userid, but does not re-check the timestamp, so a call
+longer than the REST TTL does not drop media. The remaining deliberate
+difference from coturn is that the per-user quota and the anti-hijack check
+compare only the `userid` half of the username — the timestamp prefix rotates,
+so comparing the whole string would kill live allocations whenever a client
+re-derives credentials.
 
 ### Connection control
 

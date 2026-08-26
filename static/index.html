@@ -1716,16 +1716,17 @@ password = base64(HMAC-SHA1(secret, username))</pre>
         a bare IP to refuse the permission itself.</li>
       <li>Credentials are bearer tokens with no IP binding: anyone they are shared with can use the
         relay. <span class="field">Credential horizon</span> caps how far in the future an expiry
-        may sit, and expiry is re-checked on every refresh.</li>
+        may sit; that check (and REST expiry itself) applies to Allocate only.</li>
       <li>The allocation cap is <span class="field">Max connections</span>, clamped to the relay
         port range — every allocation binds a socket, so "unlimited" is not a coherent setting here
         and is reduced with a warning.</li>
     </ul>
-    <div class="note">Two deliberate differences from coturn, worth knowing if you are migrating:
-      credential expiry is re-checked on every Refresh (coturn checks it once, so allocations can
-      outlive their credential), and the per-user quota and anti-hijack check compare only the
-      <code>userid</code> half of the username — the timestamp prefix rotates, so comparing the
-      whole string would kill live allocations whenever a client re-derives credentials.</div>`,
+    <div class="note">REST expiry is an Allocate-only gate, matching coturn and LiveKit 1.12 —
+      Refresh / CreatePermission / ChannelBind on a live allocation keep working after the
+      timestamp elapses (HMAC and userid still verified). The remaining difference from coturn
+      is that the per-user quota and anti-hijack check compare only the <code>userid</code> half
+      of the username — the timestamp prefix rotates, so comparing the whole string would kill
+      live allocations whenever a client re-derives credentials.</div>`,
 
   websocket: `
     <h3>WebSocket tunnel</h3>

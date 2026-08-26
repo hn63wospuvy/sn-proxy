@@ -177,7 +177,7 @@ authenticated client. It does not use `auth` or `forward_to`.
 | `max_permissions` | int | `0`/omitted ⇒ 128. |
 | `max_channels` | int | `0`/omitted ⇒ 64. |
 | `max_allocations_per_user` | int | Per the **userid** half of the REST username, not the full `expiry:userid` string (the timestamp prefix rotates). `0`/omitted ⇒ 16. |
-| `credential_horizon_secs` | int | Reject credentials whose embedded expiry is further out than this. `0`/omitted ⇒ 86400. |
+| `credential_horizon_secs` | int | Reject **Allocate** credentials whose embedded expiry is further out than this. `0`/omitted ⇒ 86400. Refresh / CreatePermission / ChannelBind do **not** re-check REST expiry (coturn / LiveKit 1.12); HMAC and userid still verified. |
 
 There is **no minting endpoint**. Compute the REST credential locally from the
 secret you just stored:

@@ -100,16 +100,18 @@ pub fn rest_password(secret: &[u8], username: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Split `<expiry>:<userid>` and check the expiry against `now` and `horizon`.
+/// Split `<expiry>:<userid>` without looking at the clock.
 ///
 /// Both halves must be non-empty. A bare timestamp with no userid is a legal
 /// coturn username, but it collapses every client into one quota bucket and one
 /// 441 identity, so it is refused here rather than silently degrading both.
 ///
-/// The horizon cap is a deliberate divergence from coturn, which accepts any
-/// future timestamp: without it a credential minted with an expiry in 2099 is
-/// valid forever, and a single leak is unrevocable short of rotating the secret.
-pub fn parse_username(username: &str, now: u64, horizon: u64) -> Result<Credential, AuthError> {
+/// Refresh / CreatePermission / ChannelBind call this and stop: HMAC still
+/// binds the username, and the allocation already exists. Re-checking expiry
+/// there (coturn does not; LiveKit 1.12 does not) drops a live call the moment
+/// the REST TTL elapses — 4 hours on LiveKit's external-TURN default, against
+/// meetings that run for 8.
+pub fn parse_username_shape(username: &str) -> Result<Credential, AuthError> {
     // `split_once`, not `split`/`rsplit`: only the FIRST colon delimits, since a
     // userid is free to contain colons of its own.
     let (ts, userid) = username.split_once(':').ok_or(AuthError::Malformed)?;
@@ -123,13 +125,24 @@ pub fn parse_username(username: &str, now: u64, horizon: u64) -> Result<Credenti
         return Err(AuthError::Malformed);
     }
     let expiry: u64 = ts.parse().map_err(|_| AuthError::Malformed)?;
-    if expiry <= now {
+    Ok(Credential { userid: userid.to_string(), expiry })
+}
+
+/// Split `<expiry>:<userid>` and check the expiry against `now` and `horizon`.
+///
+/// Allocate is the only request that calls this. The horizon cap is a
+/// divergence from coturn, which accepts any future timestamp: without it a
+/// credential minted with an expiry in 2099 is valid forever, and a single leak
+/// is unrevocable short of rotating the secret.
+pub fn parse_username(username: &str, now: u64, horizon: u64) -> Result<Credential, AuthError> {
+    let cred = parse_username_shape(username)?;
+    if cred.expiry <= now {
         return Err(AuthError::Expired);
     }
-    if expiry - now > horizon {
+    if cred.expiry - now > horizon {
         return Err(AuthError::Horizon);
     }
-    Ok(Credential { userid: userid.to_string(), expiry })
+    Ok(cred)
 }
 
 /// Derive the RFC 8489 §9.2.2 long-term key for a REST credential:
@@ -530,6 +543,23 @@ mod tests {
         assert!(matches!(parse_username("9999999999:alice", now, horizon), Err(AuthError::Horizon)));
         // The userid may itself contain colons; only the first splits.
         assert_eq!(parse_username("1000600:a:b", now, horizon).unwrap().userid, "a:b");
+    }
+
+    #[test]
+    fn shape_parse_accepts_an_expired_username() {
+        // Refresh / CreatePermission / ChannelBind must still extract the
+        // userid after REST expiry; Allocate remains the gate.
+        let c = parse_username_shape("999999:alice").unwrap();
+        assert_eq!(c.userid, "alice");
+        assert_eq!(c.expiry, 999_999);
+        assert!(matches!(
+            parse_username("999999:alice", 1_000_000, 86_400),
+            Err(AuthError::Expired)
+        ));
+        assert!(matches!(parse_username_shape("1000600"), Err(AuthError::Malformed)));
+        let far = parse_username_shape("9999999999:alice").unwrap();
+        assert_eq!(far.userid, "alice");
+        assert_eq!(far.expiry, 9_999_999_999);
     }
 
     #[test]

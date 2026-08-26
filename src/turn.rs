@@ -677,9 +677,22 @@ fn authenticate(srv: &Server, m: &stun::Message<'_>, client: SocketAddr, t: u64)
 
     // The client echoes back whatever realm we sent; the key derivation must
     // use the same bytes, so a mismatch can never authenticate.
-    let cred = match turn_auth::parse_username(user, t, srv.cfg.effective_horizon()) {
-        Ok(c) => c,
-        Err(_) => return Auth::Challenge(401),
+    //
+    // REST expiry is an Allocate-only gate. coturn and LiveKit 1.12 check it
+    // once, when the allocation is created; re-checking on Refresh kills a
+    // live call the moment the credential TTL elapses while the HMAC is still
+    // valid. Shape (userid + timestamp spelling) is still required so quota
+    // and the 441 anti-hijack check have a userid to key on.
+    let cred = if m.method == method::ALLOCATE {
+        match turn_auth::parse_username(user, t, srv.cfg.effective_horizon()) {
+            Ok(c) => c,
+            Err(_) => return Auth::Challenge(401),
+        }
+    } else {
+        match turn_auth::parse_username_shape(user) {
+            Ok(c) => c,
+            Err(_) => return Auth::Challenge(401),
+        }
     };
     let key = match turn_auth::credential_key(&srv.secret, user, realm) {
         Ok(k) => k,
