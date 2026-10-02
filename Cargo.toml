@@ -19,6 +19,7 @@ hkdf = "0.13.0"
 # against this crate's sha1 0.11 / md-5 0.11 (digest 0.11). Both versions are
 # already in Cargo.lock transitively, so the wrong line compiles the manifest
 # and then fails at `Hmac::<Sha1>`.
+hickory-resolver = { version = "0.25", features = ["tokio", "system-config"] }
 hmac = "0.13"
 ipnet = "2.12.0"
 md-5 = "0.11.0"
@@ -38,6 +39,7 @@ tracing = "0.1.44"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.23.1", features = ["v4"] }
+webpki-roots = "1"
 
 # Unix-only: setsid() in the daemonize pre_exec hook. On Windows we use
 # CommandExt::creation_flags instead (std, no extra dependency).

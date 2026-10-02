@@ -304,6 +304,7 @@
           <option value="udp">UDP forwarder</option>
           <option value="websocket">WebSocket tunnel</option>
           <option value="turn">TURN relay (WebRTC)</option>
+          <option value="smtp">SMTP relay (outbound)</option>
         </select>
       </div>
       <div>
@@ -479,6 +480,38 @@
             <input id="fTurnPerUser" type="number" min="0" placeholder="16" /></div>
           <div><label>Credential horizon (s, 0 = 86400)</label>
             <input id="fTurnHorizon" type="number" min="0" placeholder="86400" /></div>
+        </div>
+      </div>
+
+      <!-- SMTP egress relay -->
+      <div id="secSmtp" class="section" style="display:none;">
+        <div class="section-title">SMTP relay (outbound MX delivery)</div>
+        <div>
+          <label>HELO hostname (required)</label>
+          <input id="fSmtpHelo" placeholder="mail.example.com" oninput="onSmtpChange()" />
+        </div>
+        <div class="hint" id="smtpHeloHint"></div>
+        <div class="row2" style="margin-top:8px;">
+          <div><label>Upstream port (0 = 25)</label>
+            <input id="fSmtpPort" type="number" min="0" max="65535" placeholder="25" /></div>
+          <div><label>Max message (bytes, 0 = 35 MiB)</label>
+            <input id="fSmtpMaxMsg" type="number" min="0" placeholder="0" /></div>
+        </div>
+        <div class="check-line" style="margin-top:8px;">
+          <input type="checkbox" id="fSmtpReqTls" onchange="onSmtpChange()" />
+          <label for="fSmtpReqTls">Require STARTTLS to upstream MX</label>
+        </div>
+        <div class="hint" id="smtpTlsHint"></div>
+        <div class="check-line" style="margin-top:8px;">
+          <input type="checkbox" id="fSmtpAllowPriv" onchange="onSmtpChange()" />
+          <label for="fSmtpAllowPriv">Allow MX records resolving to private IPs (UNSAFE)</label>
+        </div>
+        <div class="hint" id="smtpPrivHint"></div>
+        <div class="hint" style="margin-top:8px;">
+          Accepts SMTP submission (AUTH LOGIN/PLAIN from the username/password fields above;
+          STARTTLS when a server keystore is configured), resolves each recipient domain's MX
+          and delivers from this host's own IP. The upstream reply is relayed verbatim — the
+          sending MTA keeps queue, retry and bounce handling.
         </div>
       </div>
 
@@ -886,10 +919,14 @@ function onProtoChange() {
   const ws = proto === "websocket";
   const udp = proto === "udp";
   const turn = proto === "turn";
+  const smtp = proto === "smtp";
   const http = proto === "http" || proto === "https";
   // TURN authenticates with the REST API only, so the username/password rows
   // would be misleading: they are not the credential a client presents.
   $("rowUser").style.display = (ss || tcp || udp || turn) ? "none" : "";
+  $("rowUser").querySelector("label").textContent = smtp
+    ? "Username (required on a public bind — without it this is an open relay)"
+    : "Username (optional — leave blank to disable auth)";
   $("rowCipher").style.display = ss ? "" : "none";
   $("rowForward").style.display = (tcp || ws || udp) ? "" : "none";
   // TCP only: the header is written raw on the upstream socket, which has no
@@ -897,18 +934,36 @@ function onProtoChange() {
   $("rowProxyProto").style.display = tcp ? "" : "none";
   $("rowPass").style.display = (tcp || udp || turn) ? "none" : "";
   $("secHttp").style.display = http ? "" : "none";
-  // TURN's turns: listener uses the same PKCS#12 keystore as an HTTPS listener.
-  $("secServerTls").style.display = (proto === "https" || turn) ? "" : "none";
+  // TURN's turns: listener uses the same PKCS#12 keystore as an HTTPS listener;
+  // for SMTP it is the certificate offered to clients via STARTTLS.
+  $("secServerTls").style.display = (proto === "https" || turn || smtp) ? "" : "none";
   // ...but turns: clients never present a client certificate, and the server
   // forces mtls off for TURN, so hide the checkbox rather than offer a setting
-  // that is silently ignored.
-  $("fMtls").parentElement.style.display = turn ? "none" : "";
-  if (turn) { $("rowTruststore").style.display = "none"; }
-  $("lblPass").textContent = ss ? "Password (required)" : "Password";
+  // that is silently ignored. Same for SMTP — MTAs do not carry client certs.
+  $("fMtls").parentElement.style.display = (turn || smtp) ? "none" : "";
+  if (turn || smtp) { $("rowTruststore").style.display = "none"; }
+  $("lblPass").textContent = ss ? "Password (required)"
+    : smtp ? "Password (SMTP AUTH credential)"
+    : "Password";
   $("secSocks5").style.display = (proto === "socks5") ? "" : "none";
   $("secTurn").style.display = turn ? "" : "none";
+  $("secSmtp").style.display = smtp ? "" : "none";
   if (proto === "socks5") onUdpChange();
   if (turn) onTurnChange();
+  if (smtp) onSmtpChange();
+}
+
+function onSmtpChange() {
+  const helo = $("fSmtpHelo").value.trim();
+  $("smtpHeloHint").textContent = helo
+    ? "" : "The hostname whose PTR record points back at this server's public IP "
+         + "(forward-confirmed rDNS). Gmail rejects delivery without it.";
+  $("smtpTlsHint").textContent = $("fSmtpReqTls").checked
+    ? "An MX that does not offer STARTTLS fails with a 4xx — the sending MTA retries."
+    : "Opportunistic: STARTTLS is used when the MX offers it, cleartext otherwise.";
+  $("smtpPrivHint").textContent = $("fSmtpAllowPriv").checked
+    ? "UNSAFE: an attacker-controlled MX could point inside your network (SSRF)."
+    : "";
 }
 
 function onTurnChange() {
@@ -1078,6 +1133,8 @@ function resetForm() {
   $("fTurnLifetime").value = ""; $("fTurnMaxDg").value = "";
   $("fTurnMaxPerms").value = ""; $("fTurnMaxChans").value = "";
   $("fTurnPerUser").value = ""; $("fTurnHorizon").value = "";
+  $("fSmtpHelo").value = ""; $("fSmtpPort").value = ""; $("fSmtpMaxMsg").value = "";
+  $("fSmtpReqTls").checked = false; $("fSmtpAllowPriv").checked = false;
   $("formErr").textContent = "";
   onMtlsChange();
 }
@@ -1142,6 +1199,12 @@ function editProxy(id) {
   $("fTurnMaxChans").value = t.max_channels || "";
   $("fTurnPerUser").value = t.max_allocations_per_user || "";
   $("fTurnHorizon").value = t.credential_horizon_secs || "";
+  const sm = p.smtp || {};
+  $("fSmtpHelo").value = sm.helo_name || "";
+  $("fSmtpPort").value = sm.upstream_port || "";
+  $("fSmtpMaxMsg").value = sm.max_message_bytes || "";
+  $("fSmtpReqTls").checked = !!sm.require_starttls;
+  $("fSmtpAllowPriv").checked = !!sm.allow_private;
   onProtoChange();
   onMtlsChange();
   $("formErr").textContent = (p.auth_enabled || p.protocol === "shadowsocks")
@@ -1200,12 +1263,13 @@ async function saveForm() {
     body.client_p12_alias = $("fClientP12Alias").value.trim() || null;
     body.client_p12_entry_password = $("fClientP12EntryPass").value || null;
   }
-  if (proto === "https" || proto === "turn") {
-    // A turns: listener uses the same keystore mechanism as an HTTPS listener.
+  if (proto === "https" || proto === "turn" || proto === "smtp") {
+    // A turns: listener uses the same keystore mechanism as an HTTPS listener;
+    // on an SMTP relay it becomes the certificate offered in STARTTLS.
     body.server_p12 = await p12Value("fServerP12", serverP12Cleared);
     body.server_p12_password = $("fServerP12Pass").value || null;
     // Never for TURN: turns: clients present no client certificate, and the
-    // server forces this off anyway.
+    // server forces this off anyway. SMTP clients likewise.
     body.mtls_required = proto === "https" && $("fMtls").checked;
     if (proto === "https") {
       body.server_truststore_p12 = await p12Value("fTruststore", truststoreCleared);
@@ -1245,6 +1309,18 @@ async function saveForm() {
     }
     if (transports.includes("tls") && !body.turn.tls_listen) {
       $("formErr").textContent = "The TLS transport needs its own listen address."; return;
+    }
+  }
+  if (proto === "smtp") {
+    body.smtp = {
+      helo_name: $("fSmtpHelo").value.trim(),
+      upstream_port: parseInt($("fSmtpPort").value) || null,
+      require_starttls: $("fSmtpReqTls").checked,
+      allow_private: $("fSmtpAllowPriv").checked,
+      max_message_bytes: parseInt($("fSmtpMaxMsg").value) || null,
+    };
+    if (!body.smtp.helo_name) {
+      $("formErr").textContent = "SMTP needs a HELO hostname — see the (i) docs."; return;
     }
   }
   if (!body.name || !body.listen_addr) {
@@ -1379,6 +1455,7 @@ const DOC_TABS = [
   { key: "udp",          label: "UDP" },
   { key: "websocket",    label: "WebSocket" },
   { key: "turn",         label: "TURN" },
+  { key: "smtp",         label: "SMTP relay" },
 ];
 
 const DOCS = {
@@ -1750,6 +1827,57 @@ password = base64(HMAC-SHA1(secret, username))</pre>
     </ul>
     <div class="note warn">Plain <code>ws://</code> is cleartext like HTTP. Front it with TLS (wss) before
       exposing it to untrusted networks.</div>`,
+
+  smtp: `
+    <h3>SMTP relay (outbound MX delivery)</h3>
+    <p class="lead">A thin <em>egress</em> relay: it accepts an SMTP session from a trusted client
+      MTA (typically your own mail server), resolves each recipient domain's MX records and opens a
+      fresh connection to the real MX <em>from this host's public IP</em>. It keeps no queue of its
+      own — the upstream reply (including rejects like a 550 rDNS failure) is relayed back to the
+      client verbatim, so the client MTA's retry/bounce machinery keeps working.</p>
+    <p>Use it when the machine running your mail server cannot speak port 25 with a clean identity —
+      e.g. an ISP that blocks outbound :25 or an IP with no usable PTR — but this host can. Point your
+      MTA's smarthost/relay route at this listener.</p>
+
+    <h4>Settings</h4>
+    <ul>
+      <li><span class="field">HELO hostname</span> (required) — the EHLO identity sent to both clients
+        and upstream MX servers. It must be the hostname whose PTR record points back at this server's
+        public IP (forward-confirmed reverse DNS); Gmail and friends reject delivery otherwise.</li>
+      <li><span class="field">Upstream port</span> — MX hosts are dialed here; 0 means 25.</li>
+      <li><span class="field">Require STARTTLS</span> — when on, an MX that does not offer STARTTLS
+        fails the recipient with a 4xx (the client MTA retries) instead of delivering cleartext.
+        Upstream certificates are always verified against the Mozilla root store when TLS is used.</li>
+      <li><span class="field">Allow private MX IPs</span> — off by default: a domain whose MX/A
+        resolves to loopback/RFC1918 is refused, so a hostile sender cannot steer connections into
+        your internal network.</li>
+      <li><span class="field">Max message</span> — the DATA phase is buffered in memory so one message
+        can fan out to several per-domain upstreams; this caps that buffer (default 35 MiB).</li>
+    </ul>
+
+    <h4>Authentication &amp; TLS</h4>
+    <ul>
+      <li>Set the <span class="field">username/password</span> fields — they become the SMTP
+        <code>AUTH LOGIN</code>/<code>PLAIN</code> credential. An unauthenticated relay bound to a
+        public or wildcard address is refused at save time (it would be an open relay). A private
+        listener (loopback, RFC1918, tailnet) may omit auth, with a startup warning.</li>
+      <li>Client-side <code>STARTTLS</code> is offered when the proxy has a PKCS#12 server keystore
+        (the same section HTTPS uses). Credentials over plaintext SMTP are sniffable — prefer
+        STARTTLS or keep the listener on a private network.</li>
+    </ul>
+
+    <h4>How a message flows</h4>
+    <ul>
+      <li>Recipients are grouped by domain; each domain gets one pooled upstream connection that
+        carries the session's <code>MAIL FROM</code> and its RCPTs.</li>
+      <li><code>DATA</code> is buffered, then replayed to every domain that accepted at least one
+        recipient. If any domain rejects, the client sees that failure and retries — a small
+        duplicate-delivery risk inherent to any fan-out relay.</li>
+      <li>Connection history shows the resolved domains as <code>mx:example.com,…</code>; it is
+        connection-level, not a per-message audit log.</li>
+    </ul>
+    <div class="note warn">This is a relay, not a mailbox: it accepts mail from your MTA and delivers
+      to MXs. Inbound mail for your domains still terminates on your own mail server.</div>`,
 };
 
 let docTab = "overview";

@@ -1,7 +1,7 @@
 //! Axum HTTP API and websocket route for the web admin.
 
 use crate::manager::{Manager, ProxySpec};
-use crate::model::{BasicAuth, HeaderOverride, Protocol, TurnConfig};
+use crate::model::{BasicAuth, HeaderOverride, Protocol, SmtpConfig, TurnConfig};
 use crate::ws;
 use axum::{
     Json, Router,
@@ -226,6 +226,9 @@ struct ProxyForm {
     /// forcing every caller to send the block.
     #[serde(default)]
     turn: Option<TurnConfig>,
+    /// SMTP relay settings (`protocol: "smtp"`). Omitted elsewhere.
+    #[serde(default)]
+    smtp: Option<SmtpConfig>,
 }
 
 impl ProxyForm {
@@ -270,6 +273,7 @@ impl ProxyForm {
             // operator choice), so it must NOT be coerced to `None`/the default.
             max_connections: self.max_connections,
             turn: self.turn.unwrap_or_default(),
+            smtp: self.smtp.unwrap_or_default(),
         }
     }
 }

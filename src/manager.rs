@@ -2,12 +2,13 @@
 //! tracking and the broadcast channel feeding realtime monitoring.
 
 use crate::model::{
-    BasicAuth, HeaderOverride, Protocol, ProxyConfig, TurnConfig, effective_max_connections,
+    BasicAuth, HeaderOverride, Protocol, ProxyConfig, SmtpConfig, TurnConfig,
+    effective_max_connections,
 };
 use crate::monitor::{ActiveConn, MonitorEvent, ProxySnapshot};
 use crate::resources::ResourceSample;
 use crate::storage::Storage;
-use crate::{http, relay, shadowsocks, socks5, tcp, tls, ws_proxy};
+use crate::{http, relay, shadowsocks, smtp, socks5, tcp, tls, ws_proxy};
 use anyhow::{Result, anyhow, bail};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use dashmap::DashMap;
@@ -26,7 +27,9 @@ use uuid::Uuid;
 pub struct ConnEntry {
     pub id: String,
     pub src_addr: String,
-    pub dst_addr: String,
+    /// Behind a Mutex: an SMTP relay only learns its destination once RCPT
+    /// domains resolve, so it writes the real `mx:host` label mid-session.
+    pub dst_addr: Mutex<String>,
     /// Bytes relayed from client to destination.
     pub bytes_sent: AtomicU64,
     /// Bytes relayed from destination to client.
@@ -161,6 +164,7 @@ pub struct ProxySpec {
     pub udp_max_dests: Option<u32>,
     pub max_connections: Option<u32>,
     pub turn: TurnConfig,
+    pub smtp: SmtpConfig,
 }
 
 impl ProxySpec {
@@ -243,6 +247,41 @@ impl ProxySpec {
                 bail!("shadowsocks needs a password");
             }
         }
+        if self.protocol == Protocol::Smtp {
+            let helo = self.smtp.helo_name.trim();
+            if helo.is_empty() {
+                // Receivers (Gmail et al.) check EHLO against the PTR of the
+                // connecting IP — an empty name silently torpedoes delivery.
+                bail!(
+                    "smtp needs smtp.helo_name — the hostname whose PTR points at \
+                     this relay's public IP (e.g. mail.example.com)"
+                );
+            }
+            if helo.len() > 253
+                || !helo
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '[' || c == ']')
+            {
+                bail!("smtp helo_name must be a hostname or [IP] literal");
+            }
+            // An unauthenticated relay on a public/wildcard bind is an open
+            // relay — the classic way to get an IP burned in an afternoon.
+            let bind_ip: Option<IpAddr> = self
+                .listen_addr
+                .rsplit_once(':')
+                .map(|(h, _)| h.trim_matches(['[', ']']).parse().ok())
+                .unwrap_or(None);
+            let public_bind = match bind_ip {
+                Some(ip) => ip.is_unspecified() || !Manager::is_internal_dest(ip),
+                None => true, // a hostname bind may resolve public — assume so
+            };
+            if public_bind && self.auth.is_none() {
+                bail!(
+                    "smtp relay on a public/wildcard listen address requires auth \
+                     (username+password) — without it this is an open relay"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -254,7 +293,7 @@ impl ProxySpec {
 /// otherwise the comparison is plaintext. A value that looks like an argon2
 /// hash but fails to parse never authenticates — it does not fall back to
 /// plaintext.
-fn verify_password(stored: &str, candidate: &str) -> bool {
+pub(crate) fn verify_password(stored: &str, candidate: &str) -> bool {
     if stored.starts_with("$argon2") {
         match PasswordHash::new(stored) {
             Ok(parsed) => Argon2::default()
@@ -509,6 +548,7 @@ impl Manager {
             udp_max_datagram: spec.udp_max_datagram,
             udp_max_dests: spec.udp_max_dests,
             turn: spec.turn,
+            smtp: spec.smtp,
             enabled: false,
         };
         self.storage.save_config(&cfg)?;
@@ -561,6 +601,7 @@ impl Manager {
             // The secret's tri-state was already resolved at the top of
             // update(), before validation.
             cfg.turn = spec.turn;
+            cfg.smtp = spec.smtp;
 
             // Tri-state PKCS#12 fields: keep / clear / replace.
             match spec.client_p12 {
@@ -627,7 +668,7 @@ impl Manager {
             // HTTPS listener. The `_ => None` fallthrough below would otherwise
             // silently discard a stored keystore, so the gate has to widen here
             // rather than be handled at the call site.
-            (Protocol::Https | Protocol::Turn, Some(p12)) if !p12.is_empty() => {
+            (Protocol::Https | Protocol::Turn | Protocol::Smtp, Some(p12)) if !p12.is_empty() => {
                 Some(tls::acceptor_from_p12(
                     p12,
                     cfg.server_p12_password.as_deref().unwrap_or(""),
@@ -820,6 +861,13 @@ impl Manager {
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| anyhow!("cannot bind {addr}: {e}"))?;
+
+        if protocol == Protocol::Smtp && runtime.config.lock().unwrap().auth.is_none() {
+            tracing::warn!(
+                "proxy {id}: smtp relay accepts unauthenticated clients — safe only because \
+                 {addr} is not a public address; keep it that way"
+            );
+        }
 
         *runtime.cancel.lock().unwrap() = Some(token.clone());
         runtime.running.store(true, Ordering::SeqCst);
@@ -1150,6 +1198,7 @@ impl Manager {
                                         Err(_) => Err(anyhow!("TLS handshake timed out")),
                                     }
                                 }
+                                Protocol::Smtp => smtp::serve(m, rt, stream, peer, t).await,
                                 Protocol::Udp => {
                                     // UDP is never dispatched through the TCP accept
                                     // loop; it has its own listen path (see Task 5).
@@ -1187,7 +1236,7 @@ impl Manager {
                     ActiveConn {
                         id: e.id.clone(),
                         src_addr: e.src_addr.clone(),
-                        dst_addr: e.dst_addr.clone(),
+                        dst_addr: e.dst_addr.lock().unwrap().clone(),
                         bytes_sent: e.bytes_sent.load(Ordering::Relaxed),
                         bytes_received: e.bytes_received.load(Ordering::Relaxed),
                         started_at: e.started_at,
@@ -1227,6 +1276,7 @@ impl Manager {
                 udp_max_datagram: cfg.udp_max_datagram,
                 udp_max_dests: cfg.udp_max_dests,
                 turn: crate::model::TurnView::from(&cfg.turn),
+                smtp: crate::model::SmtpView::from(&cfg.smtp),
                 max_connections: cfg.max_connections,
                 blocklist: {
                     let mut bl = cfg.blocklist.clone();
@@ -1283,6 +1333,7 @@ mod tests {
             udp_max_dests: None,
             max_connections: None,
             turn: TurnConfig::default(),
+            smtp: SmtpConfig::default(),
         }
     }
 
@@ -1499,6 +1550,39 @@ mod tests {
         assert!(udp_spec(Some("1.2.3.4:53")).validate().is_ok());
     }
 
+    fn smtp_spec(listen_addr: &str, auth: Option<BasicAuth>, helo: &str) -> ProxySpec {
+        let mut s = udp_spec(Some("1.2.3.4:53"));
+        s.protocol = Protocol::Smtp;
+        s.listen_addr = listen_addr.into();
+        s.auth = auth;
+        s.forward_to = None; // SMTP resolves its own destinations
+        s.smtp = SmtpConfig {
+            helo_name: helo.into(),
+            ..SmtpConfig::default()
+        };
+        s
+    }
+
+    #[test]
+    fn smtp_validate_requires_helo_and_auth_on_public_bind() {
+        // helo_name is mandatory.
+        let s = smtp_spec("127.0.0.1:2525", None, "");
+        assert!(s.validate().is_err());
+        // Public/wildcard bind without auth = open relay → refused.
+        let s = smtp_spec("0.0.0.0:2525", None, "mail.example.com");
+        assert!(s.validate().unwrap_err().to_string().contains("open relay"));
+        let s = smtp_spec("203.0.113.10:2525", None, "mail.example.com");
+        assert!(s.validate().is_err());
+        // Public bind with auth, or a private bind without, is fine.
+        let auth = Some(BasicAuth { username: "u".into(), password: "p".into() });
+        assert!(smtp_spec("0.0.0.0:2525", auth.clone(), "mail.example.com").validate().is_ok());
+        assert!(smtp_spec("100.64.1.1:2525", None, "mail.example.com").validate().is_ok());
+        assert!(smtp_spec("127.0.0.1:2525", None, "mail.example.com").validate().is_ok());
+        // Hostname syntax is enforced.
+        assert!(smtp_spec("127.0.0.1:2525", None, "bad helo!").validate().is_err());
+        assert!(smtp_spec("127.0.0.1:2525", None, "[203.0.113.10]").validate().is_ok());
+    }
+
     #[test]
     fn validate_rejects_control_chars_and_overlong_name() {
         let mut s = udp_spec(Some("1.2.3.4:53"));
@@ -1612,6 +1696,7 @@ mod tests {
             udp_max_datagram: None,
             udp_max_dests: None,
             turn: TurnConfig::default(),
+            smtp: SmtpConfig::default(),
             enabled: false,
         };
         ProxyRuntime::new(config)

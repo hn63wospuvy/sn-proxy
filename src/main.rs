@@ -13,6 +13,7 @@ mod monitor;
 mod relay;
 mod resources;
 mod shadowsocks;
+mod smtp;
 mod socks5;
 mod stop;
 mod storage;

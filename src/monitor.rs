@@ -1,6 +1,6 @@
 //! Realtime monitoring payloads broadcast to websocket clients.
 
-use crate::model::{HeaderOverride, TurnView};
+use crate::model::{HeaderOverride, SmtpView, TurnView};
 use serde::Serialize;
 
 /// A single live connection currently being relayed by a proxy.
@@ -59,6 +59,8 @@ pub struct ProxySnapshot {
     /// `TurnConfig`: the REST secret is reduced to `has_turn_secret` so a
     /// credential-minting key never crosses the API.
     pub turn: TurnView,
+    /// SMTP relay settings (`Protocol::Smtp` only).
+    pub smtp: SmtpView,
     /// Cap on concurrent connections (`None` = built-in default, `0` = unlimited).
     pub max_connections: Option<u32>,
     /// Source addresses blocked on this proxy specifically.

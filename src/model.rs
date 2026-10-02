@@ -23,6 +23,9 @@ pub enum Protocol {
     Udp,
     /// TURN relay server (RFC 8656).
     Turn,
+    /// SMTP egress relay: accepts a session from a trusted client MTA, resolves
+    /// MX for each recipient domain and relays the envelope synchronously.
+    Smtp,
 }
 
 impl Protocol {
@@ -36,6 +39,7 @@ impl Protocol {
             Protocol::Websocket => "websocket",
             Protocol::Udp => "udp",
             Protocol::Turn => "turn",
+            Protocol::Smtp => "smtp",
         }
     }
 
@@ -305,6 +309,93 @@ impl From<&TurnConfig> for TurnView {
     }
 }
 
+/// Default ceiling on a buffered SMTP message body (the DATA phase is buffered
+/// so one message can fan out to several per-domain upstreams).
+pub const SMTP_DEFAULT_MAX_MESSAGE: usize = 35 * 1024 * 1024;
+/// Hard cap on `max_message_bytes`: the body is buffered in memory, so an
+/// unbounded value is a memory-exhaustion knob, not a size policy.
+pub const SMTP_HARD_MAX_MESSAGE: usize = 256 * 1024 * 1024;
+
+/// SMTP egress relay settings (`Protocol::Smtp` only), grouped for the same
+/// reason as [`TurnConfig`]: `Manager::update` copies config field by field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SmtpConfig {
+    /// EHLO identity sent both to clients in the greeting and to upstream MX
+    /// servers. Deliverability rules (FCrDNS, EHLO/PTR match) make this the
+    /// hostname whose PTR record points back at this relay's public IP — an
+    /// empty or wrong name is the difference between delivery and a 550.
+    #[serde(default)]
+    pub helo_name: String,
+    /// Port upstream MX hosts are dialed on. RFC 5321 delivery is :25; the knob
+    /// exists for deployments where an upstream MTA listens elsewhere.
+    #[serde(default)]
+    pub upstream_port: Option<u16>,
+    /// When true, an MX that does not offer STARTTLS fails the RCPT (4xx) —
+    /// the client MTA then retries rather than the message going out cleartext.
+    /// Default is opportunistic TLS, matching how most MTAs treat unsigned
+    /// destinations.
+    #[serde(default)]
+    pub require_starttls: bool,
+    /// Allow recipient MX/A records that resolve to loopback/RFC1918/reserved
+    /// addresses. UNSAFE when the listener is reachable by untrusted clients:
+    /// an attacker-controlled domain's MX could point inside your network.
+    #[serde(default)]
+    pub allow_private: bool,
+    /// Max buffered DATA size (default [`SMTP_DEFAULT_MAX_MESSAGE`]).
+    #[serde(default)]
+    pub max_message_bytes: Option<usize>,
+}
+
+impl Default for SmtpConfig {
+    fn default() -> Self {
+        Self {
+            helo_name: String::new(),
+            upstream_port: None,
+            require_starttls: false,
+            allow_private: false,
+            max_message_bytes: None,
+        }
+    }
+}
+
+impl SmtpConfig {
+    /// Port upstream MX hosts are dialed on (default 25).
+    pub fn effective_upstream_port(&self) -> u16 {
+        self.upstream_port.filter(|p| *p > 0).unwrap_or(25)
+    }
+
+    /// Buffered DATA ceiling, clamped to [`SMTP_HARD_MAX_MESSAGE`].
+    pub fn effective_max_message(&self) -> usize {
+        self.max_message_bytes
+            .filter(|n| *n > 0)
+            .unwrap_or(SMTP_DEFAULT_MAX_MESSAGE)
+            .min(SMTP_HARD_MAX_MESSAGE)
+    }
+}
+
+/// Snapshot projection of [`SmtpConfig`]. It carries no secrets today, but is
+/// kept as a separate view so the pattern matches [`TurnView`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SmtpView {
+    pub helo_name: String,
+    pub upstream_port: Option<u16>,
+    pub require_starttls: bool,
+    pub allow_private: bool,
+    pub max_message_bytes: Option<usize>,
+}
+
+impl From<&SmtpConfig> for SmtpView {
+    fn from(c: &SmtpConfig) -> Self {
+        Self {
+            helo_name: c.helo_name.clone(),
+            upstream_port: c.upstream_port,
+            require_starttls: c.require_starttls,
+            allow_private: c.allow_private,
+            max_message_bytes: c.max_message_bytes,
+        }
+    }
+}
+
 /// Persisted configuration of a single proxy instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -422,6 +513,11 @@ pub struct ProxyConfig {
     /// see [`TurnConfig`] for why.
     #[serde(default)]
     pub turn: TurnConfig,
+
+    /// SMTP relay settings (`Protocol::Smtp` only). Grouped rather than
+    /// flattened — see [`SmtpConfig`].
+    #[serde(default)]
+    pub smtp: SmtpConfig,
 
     /// Whether the proxy should be running.
     #[serde(default = "default_true")]

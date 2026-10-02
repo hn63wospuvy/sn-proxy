@@ -15,6 +15,7 @@ realtime web admin. Everything runs on a single Tokio runtime.
 | `udp`         | Plain UDP forwarder to a fixed `host:port` destination         |
 | `websocket`   | WebSocket tunnel (RFC 6455) to a fixed `host:port` destination |
 | `turn`        | TURN relay (RFC 8656) for WebRTC — UDP/TCP/TLS, REST-API auth  |
+| `smtp`        | SMTP egress relay — accepts submission from your MTA, resolves MX, delivers from this host's IP |
 
 Each proxy also has optional advanced tuning: **TCP keep-alive** interval,
 **idle timeout** (drop connections with no traffic), **connect timeout**
@@ -74,6 +75,41 @@ difference from coturn is that the per-user quota and the anti-hijack check
 compare only the `userid` half of the username — the timestamp prefix rotates,
 so comparing the whole string would kill live allocations whenever a client
 re-derives credentials.
+
+### SMTP egress relay
+
+An `smtp` proxy is a **thin outbound relay**, not a mailbox: it accepts an SMTP
+session from a trusted client MTA (e.g. your mail server's smarthost route),
+resolves each recipient domain's MX records and delivers the message by opening
+a fresh connection to the real MX **from this host's own public IP**. That is
+the entire reason it exists — a port-forward keeps the client's source IP, while
+a relay originates a new connection and therefore uses *this* machine's
+PTR/SPF identity.
+
+- **No queue of its own.** The upstream MX reply — including rejects like a
+  `550` rDNS failure — is relayed back to the client verbatim, so the client
+  MTA keeps queue, retry and bounce (DSN) handling.
+- **`smtp.helo_name` is required** and must be the hostname whose PTR record
+  points back at this relay's public IP (forward-confirmed rDNS). Gmail rejects
+  delivery without it.
+- **Auth**: the `auth` username/password becomes the `AUTH LOGIN`/`PLAIN`
+  credential. It is **mandatory on a public or wildcard bind** (refused at save
+  time — an open relay is abuse-bait) and optional, with a warning, on private
+  binds (loopback/RFC1918/tailnet).
+- **TLS**: client-side `STARTTLS` is offered when a `server_p12` keystore (or
+  the global `tls_cert`) is configured. Upstream STARTTLS is opportunistic by
+  default with certificates verified against the Mozilla root store;
+  `require_starttls` turns a missing offer into a 4xx retry instead of
+  cleartext delivery.
+- **Recipients are pooled per domain** — one upstream connection per recipient
+  domain carries the session's `MAIL FROM` + its RCPTs; `DATA` is buffered
+  (default cap 35 MiB) and replayed per domain. If any domain rejects, the
+  client sees that failure and retries.
+- **SSRF guard**: MX/A records resolving to loopback/RFC1918/reserved are
+  refused unless `smtp.allow_private` is on.
+- **History**: connection history shows the resolved domains as
+  `mx:example.com,…`. It is connection-level accounting, not a per-message
+  audit log.
 
 ### Connection control
 

@@ -1,6 +1,6 @@
 ---
 name: sn-proxy-admin-api
-description: Use when an agent must create, update, start/stop, block, inspect or reconcile sn-proxy proxy instances over the HTTP admin API (`/api/proxies`, `/api/blocklist`, `/ws`) instead of clicking the web admin — covers login/session, the full ProxyForm field reference (socks5/http/https/shadowsocks/tcp/websocket/udp/turn), per-protocol required fields, the full-replace update trap, and error recovery.
+description: Use when an agent must create, update, start/stop, block, inspect or reconcile sn-proxy proxy instances over the HTTP admin API (`/api/proxies`, `/api/blocklist`, `/ws`) instead of clicking the web admin — covers login/session, the full ProxyForm field reference (socks5/http/https/shadowsocks/tcp/websocket/udp/turn/smtp), per-protocol required fields, the full-replace update trap, and error recovery.
 ---
 
 # sn-proxy admin API
@@ -115,9 +115,9 @@ Only `name` and `listen_addr` are structurally required; `protocol` defaults to
 | Field | Type | Applies to | Semantics |
 |---|---|---|---|
 | `name` | string | all | Required. No control characters, ≤200 chars (it is rendered in the admin UI). |
-| `protocol` | enum | all | `socks5`\|`http`\|`https`\|`shadowsocks`\|`tcp`\|`websocket`\|`udp`\|`turn`. Omitted ⇒ `socks5`. |
+| `protocol` | enum | all | `socks5`\|`http`\|`https`\|`shadowsocks`\|`tcp`\|`websocket`\|`udp`\|`turn`\|`smtp`. Omitted ⇒ `socks5`. |
 | `listen_addr` | string | all | Required, e.g. `0.0.0.0:1080`. Not validated until start. TURN UDP/TCP share this address (3478 by convention). |
-| `auth` | `{username,password}` | socks5, http, https, websocket | Omitted, or `username` exactly `""` ⇒ no auth. **Ignored for `turn`** — TURN authenticates with the REST API only (`turn.static_secret`). |
+| `auth` | `{username,password}` | socks5, http, https, websocket, smtp | Omitted, or `username` exactly `""` ⇒ no auth. **Ignored for `turn`** — TURN authenticates with the REST API only (`turn.static_secret`). For `smtp` it becomes the `AUTH LOGIN`/`PLAIN` credential — **required when the listen address is public/wildcard** (else 400 at save: an open relay). |
 | `ss_method` | string | shadowsocks | Required: `aes-128-gcm`, `aes-256-gcm` or `chacha20-ietf-poly1305`. |
 | `ss_password` | string | shadowsocks | Required, non-empty. |
 | `forward_to` | `host:port` | tcp, websocket, udp | **Required for these three.** Ignored elsewhere (TURN has no fixed destination). |
@@ -131,11 +131,11 @@ Only `name` and `listen_addr` are structurally required; `protocol` defaults to
 | `client_p12_password` | string | http, https | |
 | `client_p12_alias` | string | http, https | Keystore entry; empty ⇒ first private key. |
 | `client_p12_entry_password` | string | http, https | Rarely needed. |
-| `server_p12` | base64 | https, turn | Listener keystore for `https` and for TURN's `turns:` (TLS) transport; absent ⇒ the global `tls_cert`/`tls_key` or a self-signed cert. Browsers reject that fallback on `turns:` — see §7. |
-| `server_p12_password` | string | https, turn | |
+| `server_p12` | base64 | https, turn, smtp | Listener keystore for `https`, for TURN's `turns:` (TLS) transport, and for the SMTP client's `STARTTLS`; absent ⇒ the global `tls_cert`/`tls_key` or a self-signed cert. Browsers reject that fallback on `turns:` — see §7. |
+| `server_p12_password` | string | https, turn, smtp | |
 | `server_truststore_p12` | base64 | https | CA set validating client certs. |
 | `server_truststore_password` | string | https | |
-| `mtls_required` | bool | https | Require a client certificate. Default `false`. Forced off for `turn` (`turns:` clients never present one). |
+| `mtls_required` | bool | https | Require a client certificate. Default `false`. Forced off for `turn` (`turns:` clients never present one); meaningless for `smtp`. |
 | `udp_associate_enabled` | bool | socks5 | **Omitted ⇒ `true`.** `false` makes the server reply `0x07` to `CMD=0x03`. |
 | `udp_allow_private` | bool | socks5 | Allows RFC1918/internal UDP destinations. **SSRF risk** — see §7. |
 | `udp_bind_addr` | string | socks5 | Relay socket bind; default = listener IP. |
@@ -143,6 +143,7 @@ Only `name` and `listen_addr` are structurally required; `protocol` defaults to
 | `udp_max_datagram` | int | socks5 | Default 64 KiB. `0` ⇒ default. |
 | `udp_max_dests` | int | socks5 | `0`/omitted ⇒ unlimited. |
 | `turn` | object | turn | Nested TURN settings. Omitted ⇒ empty-realm / no-secret defaults, which **fail validate**. See the table below. Always send the whole object on update — only `static_secret` is tri-state. |
+| `smtp` | object | smtp | Nested SMTP-relay settings. Omitted ⇒ empty `helo_name`, which **fails validate**. See the table below. |
 
 Not settable through this body: `id` (server-generated UUID), `enabled` (use
 start/stop), `blocklist` (use the blocklist routes).
@@ -198,6 +199,30 @@ print(base64.b64encode(hmac.new(s.encode(), u.encode(), hashlib.sha1).digest()).
 port-range size. `0` (unlimited) is not honoured — every allocation binds a
 socket, so the cap becomes the range capacity.
 
+### `smtp` object
+
+An `smtp` proxy is a thin **egress relay**: it accepts SMTP submission from a
+trusted client MTA (typically your own mail server), resolves each recipient
+domain's MX records and delivers from this host's own public IP. It keeps **no
+queue** — the upstream MX reply is relayed back to the client verbatim, so the
+client MTA's retry/bounce machinery still owns delivery. Recipients are grouped
+by domain, one pooled upstream connection each; `DATA` is buffered (bounded by
+`max_message_bytes`) and replayed per domain. History rows show the resolved
+domains as `mx:example.com,…`.
+
+| Field | Type | Semantics |
+|---|---|---|
+| `helo_name` | string | **Required.** EHLO identity sent to clients and upstream MXs. Must be the hostname whose PTR points back at this relay's public IP (FCrDNS) — an empty or wrong one is the difference between delivery and a 550. Hostname or `[IP]` literal, ≤253 chars. |
+| `upstream_port` | int | Port MX hosts are dialed on. `0`/omitted ⇒ 25. |
+| `require_starttls` | bool | `true` ⇒ an MX without STARTTLS fails the RCPT with a 4xx instead of receiving cleartext. Upstream certs are always verified against Mozilla roots (`webpki-roots`) when TLS runs. |
+| `allow_private` | bool | Permit MX/A records resolving to loopback/RFC1918/reserved. Default `false`. UNSAFE on untrusted listeners — SSRF via attacker-controlled DNS. |
+| `max_message_bytes` | int | Buffered DATA ceiling. `0`/omitted ⇒ 35 MiB; hard cap 256 MiB. |
+
+The whole object is a full replace on update (no tri-state fields inside).
+Client-side `STARTTLS` is offered only when `server_p12` (or the global
+`tls_cert`) is configured; `AUTH` offers `LOGIN` + `PLAIN` whenever `auth` is
+set, and an unauthenticated relay is only allowed on a private bind.
+
 ### Minimal bodies per protocol
 
 ```jsonc
@@ -220,7 +245,7 @@ socket, so the cap becomes the range capacity.
  "ss_method":"aes-256-gcm","ss_password":"…"}
 
 // tcp forwarder, 30 s connect timeout, unlimited connections
-{"name":"smtp-relay","protocol":"tcp","listen_addr":"0.0.0.0:2525",
+{"name":"tcp-smtp","protocol":"tcp","listen_addr":"0.0.0.0:2525",
  "forward_to":"mail.example.com:25","connect_timeout_secs":30,
  "max_connections":0}
 
@@ -246,6 +271,15 @@ socket, so the cap becomes the range capacity.
  "turn":{"transports":["udp","tcp","tls"],"tls_listen":"0.0.0.0:5349",
          "realm":"turn.example.com","static_secret":"<≥16 bytes>",
          "relay_ip":"203.0.113.10"}}
+
+// smtp egress relay on a private/tailnet bind (auth optional there), or on a
+// public bind where auth is mandatory. helo_name = the host whose PTR points
+// back at this machine's public IP.
+{"name":"mx-egress","protocol":"smtp","listen_addr":"100.64.0.1:2525",
+ "smtp":{"helo_name":"mail.example.com"}}
+{"name":"mx-egress-pub","protocol":"smtp","listen_addr":"0.0.0.0:2525",
+ "auth":{"username":"mta","password":"<secret>"},
+ "smtp":{"helo_name":"mail.example.com","require_starttls":true}}
 ```
 
 ## 4. Create and start
@@ -358,6 +392,14 @@ option the user asks for, but say plainly what it costs:
 - **TURN `transports: ["udp"]` only** — Send indications and ChannelData carry
   no MESSAGE-INTEGRITY, so the 5-tuple is the only authenticator on the datapath.
   `turns:`/`tcp` is the transport that resists spoofing.
+- **`smtp` without `auth` on a public bind** — refused outright (400): an open
+  SMTP relay is abuse-bait. On a private bind it is allowed but logged as a
+  warning — keep that bind private forever.
+- **`smtp.allow_private: true`** — MX/A records may point at loopback/RFC1918 —
+  SSRF via attacker-controlled DNS. Leave off on anything untrusted can reach.
+- **`smtp.helo_name` that does not match PTR** — the single most common cause
+  of remote 550s. The name must be forward-confirmed against this machine's
+  *public* IP, not the listen address.
 - **`turns:` without a publicly-trusted `server_p12`** — the listener falls back
   to the global self-signed cert. Browsers validate `turns:` against the OS trust
   store with no JS bypass, so every browser client is rejected. Start still

@@ -6,7 +6,7 @@ use crate::model::{ConnectionRecord, now_ms};
 use crate::storage::Storage;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -175,7 +175,7 @@ pub async fn tracked<F, Fut>(
     let entry = Arc::new(ConnEntry {
         id: conn_id.clone(),
         src_addr: src_addr.clone(),
-        dst_addr: dst_addr.clone(),
+        dst_addr: Mutex::new(dst_addr),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
         started_at: now_ms(),
@@ -201,7 +201,7 @@ pub async fn tracked<F, Fut>(
         id: conn_id,
         proxy_id,
         src_addr,
-        dst_addr,
+        dst_addr: entry.dst_addr.lock().unwrap().clone(),
         bytes_sent: sent,
         bytes_received: received,
         started_at: entry.started_at,
@@ -224,7 +224,7 @@ pub fn udp_session_start(
     let entry = Arc::new(ConnEntry {
         id: conn_id.clone(),
         src_addr: src,
-        dst_addr: dst,
+        dst_addr: Mutex::new(dst),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
         started_at: now_ms(),
@@ -253,7 +253,7 @@ pub fn udp_session_end(
         id: entry.id.clone(),
         proxy_id,
         src_addr: entry.src_addr.clone(),
-        dst_addr: entry.dst_addr.clone(),
+        dst_addr: entry.dst_addr.lock().unwrap().clone(),
         bytes_sent: sent,
         bytes_received: received,
         started_at: entry.started_at,
@@ -276,6 +276,17 @@ pub struct Counting<S> {
 impl<S> Counting<S> {
     pub fn new(inner: S, entry: Arc<ConnEntry>) -> Self {
         Self { inner, entry }
+    }
+
+    /// The bookkeeping entry — kept so a mid-session upgrade (SMTP STARTTLS)
+    /// can rebuild the wrapper around a new stream without losing counters.
+    pub fn entry(&self) -> Arc<ConnEntry> {
+        self.entry.clone()
+    }
+
+    /// Unwrap the counted stream (mid-session TLS upgrade).
+    pub fn into_inner(self) -> S {
+        self.inner
     }
 }
 
@@ -359,6 +370,7 @@ mod tests {
             udp_max_datagram: None,
             udp_max_dests: None,
             turn: crate::model::TurnConfig::default(),
+            smtp: crate::model::SmtpConfig::default(),
             enabled: false,
         };
         Arc::new(ProxyRuntime::new(cfg))
@@ -374,7 +386,7 @@ mod tests {
         let rt = runtime();
         let entry = udp_session_start(&rt, "5.5.5.5:40000".into(), "1.2.3.4:53".into());
         assert_eq!(entry.src_addr, "5.5.5.5:40000");
-        assert_eq!(entry.dst_addr, "1.2.3.4:53");
+        assert_eq!(entry.dst_addr.lock().unwrap().as_str(), "1.2.3.4:53");
         assert_eq!(rt.conns.len(), 1);
         assert_eq!(rt.total_connections.load(Ordering::Relaxed), 1);
     }
