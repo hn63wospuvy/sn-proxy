@@ -229,11 +229,14 @@ port-in-use error is reported on the console instead of vanishing into the
 background.
 
 Stop every running background instance with **`sn-proxy stop`**. It matches
-processes by executable name (so it also catches orphans from earlier runs that
-the single-entry pidfile no longer tracks), skips the stop command's own
-process, force-terminates the rest, and removes `<data_dir>/sn-proxy.pid`. Pass
-the same `-d`/`--data-dir` (or `-c`) you started with so the right pidfile is
-cleaned; the kill itself works regardless of pidfile state. To stop a single
+processes by executable name — both the canonical `sn-proxy`/`sn-proxy.exe`
+name and the running binary's own name, so a renamed copy (e.g. `sn-proxy.new`
+during a binary upgrade) still reaps daemons started from the canonical name
+and vice versa — catching orphans the single-entry pidfile no longer tracks,
+skips the stop command's own process, force-terminates the rest, and removes
+`<data_dir>/sn-proxy.pid`. Pass the same `-d`/`--data-dir` (or `-c`) you
+started with so the right pidfile is cleaned; the kill itself works regardless
+of pidfile state. To stop a single
 instance instead, use the OS with its pid (`taskkill /PID <N>` on Windows,
 `kill <N>` on Unix).
 
