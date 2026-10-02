@@ -217,6 +217,7 @@ domains as `mx:example.com,…`.
 | `require_starttls` | bool | `true` ⇒ an MX without STARTTLS fails the RCPT with a 4xx instead of receiving cleartext. Upstream certs are always verified against Mozilla roots (`webpki-roots`) when TLS runs. |
 | `allow_private` | bool | Permit MX/A records resolving to loopback/RFC1918/reserved. Default `false`. UNSAFE on untrusted listeners — SSRF via attacker-controlled DNS. |
 | `max_message_bytes` | int | Buffered DATA ceiling. `0`/omitted ⇒ 35 MiB; hard cap 256 MiB. |
+| `dns_servers` | `string[]` | Explicit DNS resolver IPs for MX/A lookups. `[]`/omitted ⇒ system config, falling back to public DNS (Cloudflare+Google) when `/etc/resolv.conf` cannot be parsed — seen in the field on systemd-stub hosts. Entries that are not IPs ⇒ 400. |
 
 The whole object is a full replace on update (no tri-state fields inside).
 Client-side `STARTTLS` is offered only when `server_p12` (or the global

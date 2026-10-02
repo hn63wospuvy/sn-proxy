@@ -281,6 +281,11 @@ impl ProxySpec {
                      (username+password) — without it this is an open relay"
                 );
             }
+            for s in &self.smtp.dns_servers {
+                if s.trim().parse::<IpAddr>().is_err() {
+                    bail!("smtp.dns_servers entry {s:?} is not an IP address");
+                }
+            }
         }
         Ok(())
     }

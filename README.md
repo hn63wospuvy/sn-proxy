@@ -107,6 +107,9 @@ PTR/SPF identity.
   client sees that failure and retries.
 - **SSRF guard**: MX/A records resolving to loopback/RFC1918/reserved are
   refused unless `smtp.allow_private` is on.
+- **DNS**: MX/A lookups use the system resolver; `smtp.dns_servers` pins explicit
+  resolver IPs, and an unparseable `resolv.conf` falls back to public DNS
+  (Cloudflare + Google) with a warning.
 - **History**: connection history shows the resolved domains as
   `mx:example.com,…`. It is connection-level accounting, not a per-message
   audit log.

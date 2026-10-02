@@ -497,6 +497,13 @@
           <div><label>Max message (bytes, 0 = 35 MiB)</label>
             <input id="fSmtpMaxMsg" type="number" min="0" placeholder="0" /></div>
         </div>
+        <div style="margin-top:8px;">
+          <label>DNS resolvers (comma-separated IPs, blank = system)</label>
+          <input id="fSmtpDns" placeholder="1.1.1.1, 8.8.8.8" />
+        </div>
+        <div class="hint">Pin resolver IPs when the host's resolv.conf is a stub the
+          parser rejects — otherwise the system config is used, with a public-DNS
+          fallback if it cannot be read.</div>
         <div class="check-line" style="margin-top:8px;">
           <input type="checkbox" id="fSmtpReqTls" onchange="onSmtpChange()" />
           <label for="fSmtpReqTls">Require STARTTLS to upstream MX</label>
@@ -1134,6 +1141,7 @@ function resetForm() {
   $("fTurnMaxPerms").value = ""; $("fTurnMaxChans").value = "";
   $("fTurnPerUser").value = ""; $("fTurnHorizon").value = "";
   $("fSmtpHelo").value = ""; $("fSmtpPort").value = ""; $("fSmtpMaxMsg").value = "";
+  $("fSmtpDns").value = "";
   $("fSmtpReqTls").checked = false; $("fSmtpAllowPriv").checked = false;
   $("formErr").textContent = "";
   onMtlsChange();
@@ -1205,6 +1213,7 @@ function editProxy(id) {
   $("fSmtpMaxMsg").value = sm.max_message_bytes || "";
   $("fSmtpReqTls").checked = !!sm.require_starttls;
   $("fSmtpAllowPriv").checked = !!sm.allow_private;
+  $("fSmtpDns").value = (sm.dns_servers || []).join(", ");
   onProtoChange();
   onMtlsChange();
   $("formErr").textContent = (p.auth_enabled || p.protocol === "shadowsocks")
@@ -1318,6 +1327,7 @@ async function saveForm() {
       require_starttls: $("fSmtpReqTls").checked,
       allow_private: $("fSmtpAllowPriv").checked,
       max_message_bytes: parseInt($("fSmtpMaxMsg").value) || null,
+      dns_servers: $("fSmtpDns").value.split(",").map(s => s.trim()).filter(Boolean),
     };
     if (!body.smtp.helo_name) {
       $("formErr").textContent = "SMTP needs a HELO hostname — see the (i) docs."; return;

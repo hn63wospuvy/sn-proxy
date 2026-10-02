@@ -344,6 +344,11 @@ pub struct SmtpConfig {
     /// Max buffered DATA size (default [`SMTP_DEFAULT_MAX_MESSAGE`]).
     #[serde(default)]
     pub max_message_bytes: Option<usize>,
+    /// Explicit DNS resolvers (IP addresses) for MX/A lookups. Empty = use the
+    /// system config, falling back to public DNS when `/etc/resolv.conf` is
+    /// unreadable (e.g. a systemd stub with directives the parser rejects).
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
 }
 
 impl Default for SmtpConfig {
@@ -354,6 +359,7 @@ impl Default for SmtpConfig {
             require_starttls: false,
             allow_private: false,
             max_message_bytes: None,
+            dns_servers: Vec::new(),
         }
     }
 }
@@ -382,6 +388,7 @@ pub struct SmtpView {
     pub require_starttls: bool,
     pub allow_private: bool,
     pub max_message_bytes: Option<usize>,
+    pub dns_servers: Vec<String>,
 }
 
 impl From<&SmtpConfig> for SmtpView {
@@ -392,6 +399,7 @@ impl From<&SmtpConfig> for SmtpView {
             require_starttls: c.require_starttls,
             allow_private: c.allow_private,
             max_message_bytes: c.max_message_bytes,
+            dns_servers: c.dns_servers.clone(),
         }
     }
 }

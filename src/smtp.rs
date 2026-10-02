@@ -71,8 +71,11 @@ trait Resolve: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>>> + Send + 'a>>;
 }
 
-/// Real resolver backed by the system DNS configuration (`/etc/resolv.conf`).
-struct HickoryResolve;
+/// Real resolver backed by system DNS, an explicit `dns_servers` list, or a
+/// public-DNS fallback when the system config cannot be parsed.
+struct HickoryResolve {
+    resolver: DnsResolver,
+}
 
 impl Resolve for HickoryResolve {
     fn mx<'a>(
@@ -80,8 +83,7 @@ impl Resolve for HickoryResolve {
         domain: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>> {
         Box::pin(async move {
-            let resolver = hickory_resolver()?;
-            let lookup = resolver.mx_lookup(domain).await;
+            let lookup = self.resolver.mx_lookup(domain).await;
             match lookup {
                 Ok(mx) => {
                     let mut hosts: Vec<(u16, String)> = mx
@@ -108,13 +110,13 @@ impl Resolve for HickoryResolve {
         host: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>>> + Send + 'a>> {
         Box::pin(async move {
-            let resolver = hickory_resolver()?;
             // Bare IP literals short-circuit DNS — legal as an implicit MX
             // target in this relay even though RFC 5321 forbids them in records.
             if let Ok(ip) = host.parse::<IpAddr>() {
                 return Ok(vec![ip]);
             }
-            let lookup = resolver
+            let lookup = self
+                .resolver
                 .lookup_ip(host)
                 .await
                 .map_err(|e| anyhow!("A/AAAA lookup for {host}: {e}"))?;
@@ -123,17 +125,52 @@ impl Resolve for HickoryResolve {
     }
 }
 
-/// The process-wide resolver — built lazily so a proxy that never sees an RCPT
-/// never touches the resolver configuration.
-fn hickory_resolver() -> Result<&'static DnsResolver> {
-    static R: OnceLock<DnsResolver> = OnceLock::new();
-    if let Some(r) = R.get() {
-        return Ok(r);
-    }
-    let r = hickory_resolver::Resolver::builder_tokio()
-        .map_err(|e| anyhow!("cannot build DNS resolver from system config: {e}"))?
-        .build();
-    Ok(R.get_or_init(|| r))
+/// Build the session's DNS resolver from the proxy config:
+/// 1. explicit `dns_servers` IPs, when configured;
+/// 2. else the system resolver configuration;
+/// 3. else public DNS (Cloudflare + Google) — the escape hatch for hosts whose
+///    `/etc/resolv.conf` is a systemd stub or carries vendor directives the
+///    parser rejects (observed in the field: "directive at line 2 is
+///    improperly formatted").
+fn build_resolver(cfg: &SmtpConfig) -> Result<Arc<dyn Resolve>> {
+    use hickory_resolver::Resolver;
+    use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
+    use hickory_resolver::name_server::TokioConnectionProvider;
+
+    let resolver: DnsResolver = if !cfg.dns_servers.is_empty() {
+        let mut ips = Vec::with_capacity(cfg.dns_servers.len());
+        for s in &cfg.dns_servers {
+            let ip: IpAddr = s
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("smtp.dns_servers entry {s:?} is not an IP address"))?;
+            ips.push(ip);
+        }
+        let group = NameServerConfigGroup::from_ips_clear(&ips, 53, true);
+        Resolver::builder_with_config(
+            ResolverConfig::from_parts(None, Vec::new(), group),
+            TokioConnectionProvider::default(),
+        )
+        .build()
+    } else {
+        match Resolver::builder_tokio() {
+            Ok(b) => b.build(),
+            Err(e) => {
+                tracing::warn!(
+                    "system DNS config unusable ({e}); \
+                     smtp relay falls back to public resolvers (cloudflare+google)"
+                );
+                let mut group = NameServerConfigGroup::cloudflare();
+                group.merge(NameServerConfigGroup::google());
+                Resolver::builder_with_config(
+                    ResolverConfig::from_parts(None, Vec::new(), group),
+                    TokioConnectionProvider::default(),
+                )
+                .build()
+            }
+        }
+    };
+    Ok(Arc::new(HickoryResolve { resolver }))
 }
 
 type DnsResolver = hickory_resolver::Resolver<hickory_resolver::name_server::TokioConnectionProvider>;
@@ -326,12 +363,13 @@ pub async fn serve(
         .map(Duration::from_secs)
         .unwrap_or(CLIENT_IDLE_DEFAULT);
 
+    let resolver = build_resolver(&cfg)?;
     let mut s = Session {
         cfg,
         auth,
         acceptor,
         connector: upstream_connector(),
-        resolver: Arc::new(HickoryResolve),
+        resolver,
         idle,
         connect_timeout,
         authenticated: false,
@@ -1093,6 +1131,7 @@ mod tests {
                 require_starttls: false,
                 allow_private: true,
                 max_message_bytes: None,
+                dns_servers: Vec::new(),
             },
             auth,
             acceptor: None,
