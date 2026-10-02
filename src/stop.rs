@@ -3,10 +3,11 @@
 //! Detached daemons are spawned with no console and only the most recently
 //! started pid is recorded in the pidfile, so a pidfile-only stop would leak
 //! orphaned instances. Instead this enumerates every live process whose
-//! executable basename matches the current binary (e.g. `sn-proxy.exe` on
-//! Windows, `sn-proxy` on Unix), skips the pid of the process running the stop
-//! command itself, and force-terminates the rest. The daemon pidfile is then
-//! removed best-effort.
+//! executable basename is either the canonical `sn-proxy`/`sn-proxy.exe` name
+//! or the current binary's own name (so `sn-proxy.new stop` still reaps a
+//! daemon started from a differently-named copy), skips the pid of the process
+//! running the stop command itself, and force-terminates the rest. The daemon
+//! pidfile is then removed best-effort.
 //!
 //! Termination is forceful on both platforms (Windows `TerminateProcess`,
 //! Unix `SIGKILL`). The server installs no signal/graceful-shutdown handler, so
@@ -17,16 +18,17 @@
 /// cleans the pidfile under `data_dir`, prints a summary, and exits the process
 /// (0 when nothing failed, 1 when at least one process could not be terminated).
 pub fn run(data_dir: &str) -> ! {
-    let target = target_image_name();
+    let targets = target_image_names();
+    let label = targets.join("/");
     let self_pid = std::process::id();
 
-    let mut pids = enumerate_pids(&target);
+    let mut pids = enumerate_pids(&targets);
     pids.retain(|&pid| pid != self_pid && pid != 0);
     pids.sort_unstable();
     pids.dedup();
 
     if pids.is_empty() {
-        println!("no other {target} process is running");
+        println!("no other {label} process is running");
         cleanup_pidfile(data_dir);
         std::process::exit(0);
     }
@@ -46,7 +48,7 @@ pub fn run(data_dir: &str) -> ! {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        println!("stopped {} {target} process(es): {list}", killed.len());
+        println!("stopped {} {label} process(es): {list}", killed.len());
     }
     for (pid, err) in &failed {
         eprintln!("warning: could not stop pid {pid}: {err}");
@@ -56,19 +58,22 @@ pub fn run(data_dir: &str) -> ! {
     std::process::exit(if failed.is_empty() { 0 } else { 1 });
 }
 
-/// Executable basename to match processes against (`sn-proxy.exe` / `sn-proxy`),
-/// taken from the running binary so a renamed build still finds its own kin.
-fn target_image_name() -> String {
-    std::env::current_exe()
+/// Executable basenames to match processes against. Always contains the
+/// canonical `sn-proxy`/`sn-proxy.exe` name; the running binary's own basename
+/// is added when it differs (a renamed copy such as `sn-proxy.new` still reaps
+/// daemons started from the canonical name, and vice versa).
+fn target_image_names() -> Vec<String> {
+    let canonical = if cfg!(windows) { "sn-proxy.exe" } else { "sn-proxy" };
+    let mut names = vec![canonical.to_string()];
+    if let Some(own) = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "sn-proxy.exe".to_string()
-            } else {
-                "sn-proxy".to_string()
-            }
-        })
+    {
+        if !names.iter().any(|n| name_matches(n, &own)) {
+            names.push(own);
+        }
+    }
+    names
 }
 
 /// Case-insensitive comparison of a process image basename against the target.
@@ -93,7 +98,7 @@ fn cleanup_pidfile(data_dir: &str) {
 }
 
 #[cfg(target_os = "windows")]
-fn enumerate_pids(target: &str) -> Vec<u32> {
+fn enumerate_pids(targets: &[String]) -> Vec<u32> {
     use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
 
     // EnumProcesses cannot report that it truncated other than by filling the
@@ -118,13 +123,13 @@ fn enumerate_pids(target: &str) -> Vec<u32> {
         buf.truncate(count);
         return buf
             .into_iter()
-            .filter(|&pid| pid != 0 && image_matches(pid, target))
+            .filter(|&pid| pid != 0 && image_matches(pid, targets))
             .collect();
     }
 }
 
 #[cfg(target_os = "windows")]
-fn image_matches(pid: u32, target: &str) -> bool {
+fn image_matches(pid: u32, targets: &[String]) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -150,7 +155,7 @@ fn image_matches(pid: u32, target: &str) -> bool {
         std::path::Path::new(&path)
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| name_matches(n, target))
+            .is_some_and(|n| targets.iter().any(|t| name_matches(n, t)))
     }
 }
 
@@ -176,7 +181,7 @@ fn terminate(pid: u32) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn enumerate_pids(target: &str) -> Vec<u32> {
+fn enumerate_pids(targets: &[String]) -> Vec<u32> {
     let mut pids = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return pids;
@@ -187,7 +192,7 @@ fn enumerate_pids(target: &str) -> Vec<u32> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        if image_matches(pid, target) {
+        if image_matches(pid, targets) {
             pids.push(pid);
         }
     }
@@ -195,16 +200,16 @@ fn enumerate_pids(target: &str) -> Vec<u32> {
 }
 
 #[cfg(unix)]
-fn image_matches(pid: u32, target: &str) -> bool {
+fn image_matches(pid: u32, targets: &[String]) -> bool {
     // Prefer the exe symlink basename — full and untruncated — and fall back to
     // /proc/<pid>/comm (truncated to 15 chars) when the link is unreadable.
     if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            return name_matches(name, target);
+            return targets.iter().any(|t| name_matches(name, t));
         }
     }
     if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        return name_matches(comm.trim(), target);
+        return targets.iter().any(|t| name_matches(comm.trim(), t));
     }
     false
 }
@@ -222,7 +227,7 @@ fn terminate(pid: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::name_matches;
+    use super::{name_matches, target_image_names};
 
     #[test]
     fn name_matches_is_case_insensitive() {
@@ -236,5 +241,11 @@ mod tests {
         assert!(!name_matches("not-sn-proxy.exe", "sn-proxy.exe"));
         assert!(!name_matches("sn-proxy-helper", "sn-proxy"));
         assert!(!name_matches("", "sn-proxy"));
+    }
+
+    #[test]
+    fn target_image_names_includes_canonical() {
+        let canonical = if cfg!(windows) { "sn-proxy.exe" } else { "sn-proxy" };
+        assert!(target_image_names().iter().any(|n| n == canonical));
     }
 }
